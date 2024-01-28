@@ -1,0 +1,28 @@
+[package]
+name = "caplog"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+capnp = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+capnp-futures = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+capnp-import = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+capnp-rpc = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+capnp-macros = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+color-eyre = "0.6"
+eyre = "0.6"
+tokio = { version = "1.18", features = ["full"] }
+tokio-util = "0.7"
+thiserror = "1.0"
+bitfield-struct = "0.5"
+fastmurmur3 = "0.2.0"
+memmap2 = "0.7.1"
+num = { version = "0.4.1", features = ["std"] }
+# quicklz = "0.3"
+
+[dev-dependencies]
+murmur3 = "0.5.1"
+rand = "0.8.5"
+tempfile = "3"
