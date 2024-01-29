@@ -4,7 +4,6 @@ use bitfield_struct::bitfield;
 use eyre::eyre;
 use eyre::Result;
 use memmap2::MmapMut;
-use rand::RngCore;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::default::Default;
@@ -212,8 +211,10 @@ impl HashedArrayStorage {
         // We do this alignment check once, and the rest of the time we do the unguarded direct mutation.
         let (prefix, slice, tail) = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>();
 
-        if prefix.len() > 0 || tail.len() > 0 {
+        if prefix.len() > 0 {
             return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+        } else if tail.len() > 0 {
+            return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), tail.len()).into());
         }
 
         // Initialize our canary integer at offset 0, which is always invalid.
@@ -242,6 +243,11 @@ impl HashedArrayStorage {
     }
 
     pub fn new_file(src: File, new_size: u64) -> Result<HashedArrayStorage> {
+        assert_eq!(
+            new_size % size_of::<u64>() as u64,
+            0,
+            "size MUST be a multiple of an unsigned 64-bit integer"
+        );
         // Create a new file with enough room for the header, a canary word, and then one maximum size node
         src.set_len((HEADER_BYTES + size_of::<u64>() + MAX_NODE_BYTES) as u64 + new_size)?;
         unsafe {
@@ -262,6 +268,12 @@ impl HashedArrayStorage {
     }
 
     pub fn new_ref(src: &File, new_size: u64) -> Result<HashedArrayStorage> {
+        assert_eq!(
+            new_size % size_of::<u64>() as u64,
+            0,
+            "size MUST be a multiple of an unsigned 64-bit integer"
+        );
+
         // Create a new file with enough room for the header, a canary word, and then one maximum size node
         src.set_len((HEADER_BYTES + size_of::<u64>() + MAX_NODE_BYTES) as u64 + new_size)?;
         unsafe {
@@ -328,7 +340,6 @@ impl HashedArrayStorage {
     // Initializes a new section at the given byte offset by adding it to the freelist. We do this in reverse order so the freelist
     // doesn't try to fill up the new section backwards.
     fn init_section(&mut self, byte_offset: usize, byte_end: usize) -> Result<()> {
-        let test = self.words();
         if let Some(mapping) = self.mapping.as_mut() {
             unsafe {
                 let ptr = mapping.as_mut_ptr();
@@ -421,15 +432,22 @@ impl HashedArrayStorage {
     }
 
     #[cfg(target_os = "linux")]
-    fn resize(&self) {
-        self.flush();
-        let new_size = self.mapping.len() * 2;
-        self.handle.set_len(new_size as u64);
-        self.mapping.remap(new_size, MmapMut::RemapOptions::may_move)
+    pub fn resize(&self) -> Result<()> {
+        self.flush()?;
+        if let Some(m) = self.mapping {
+            let new_size = m.len() * 2;
+            if let Some(handle) = self.handle.as_ref() {
+                handle.set_len(new_size as u64);
+            }
+            m.remap(new_size, MmapMut::RemapOptions::may_move)?;
+            return Ok(());
+        }
+
+        Err(HashedArrayTrieError::OutOfMemory.into())
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn resize(&mut self) -> Result<()> {
+    pub fn resize(&mut self) -> Result<()> {
         self.flush()?;
         if let Some(handle) = self.handle.as_ref() {
             let old = mem::take(&mut self.mapping);
@@ -450,7 +468,7 @@ impl HashedArrayStorage {
         Err(HashedArrayTrieError::OutOfMemory.into())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         if let Some(mapping) = self.mapping.as_mut() {
             mapping.flush()?;
         }
@@ -568,7 +586,7 @@ where
             words[offset + 1..offset + 1 + count].fill(0);
 
             // After setting the known cells to zero, walk forward to see if there were any orphaned cells
-            while words[offset + 1 + count] == 0 {
+            while offset + 1 + count < words.len() && words[offset + 1 + count] == 0 {
                 count += 1;
             }
 
@@ -601,7 +619,7 @@ where
             return Err(HashedArrayTrieError::AlreadyExists(store.words()[offset + index as usize + 1]).into());
         }
         // If we are mutable and we have space, we just append the child and return nothing
-        if mutable && store.words()[offset + count + 1] == 0 {
+        if mutable && offset + count + 1 < store.words().len() && store.words()[offset + count + 1] == 0 {
             Self::append(offset, store.words_mut(), index, value, count);
             Ok(0)
         } else {
@@ -724,7 +742,7 @@ where
         let store = self.storage.borrow();
         let mut offset: usize = self.offset as usize;
         let mut bits = size_of::<K>() * 8;
-        let (header, words) = store.parts();
+        let words = store.words();
 
         while bits > 5 {
             let node = HashedArrayTrieFlags::from_ref(&words[offset]);
@@ -828,8 +846,6 @@ impl Drop for HashedArrayStorage {
 }
 
 #[cfg(test)]
-use rand::rngs::StdRng;
-#[cfg(test)]
 use rand::seq::SliceRandom;
 #[cfg(test)]
 use rand::thread_rng;
@@ -849,7 +865,7 @@ where
 
 #[test]
 fn test_storage_new() -> Result<()> {
-    let store = HashedArrayStorage::new_file(tempfile()?, 64)?;
+    let _ = HashedArrayStorage::new_file(tempfile()?, 64)?;
     Ok(())
 }
 
@@ -907,7 +923,7 @@ fn test_storage_load() -> Result<()> {
 fn test_empty() -> Result<()> {
     let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 32)?));
     // We will eventually put a 128-bit FullLogID struct in here
-    let trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
+    let _: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     Ok(())
 }
 
@@ -1066,7 +1082,7 @@ fn test_fill_random() -> Result<()> {
     let mut track: Vec<u128> = Vec::new();
 
     // Fill trie with random noise
-    for _ in 0..=0xFFFFF {
+    for _ in 0..=0xFFFF {
         let key = get_next_u128(&mut rng);
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
@@ -1113,5 +1129,28 @@ fn test_fill_random() -> Result<()> {
 
     storage.borrow_mut().flush()?;
 
+    Ok(())
+}
+
+#[test]
+fn test_allocations() -> Result<()> {
+    for sz in 1..=512 {
+        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(
+            tempfile()?,
+            sz * size_of::<u64>() as u64,
+        )?));
+        let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
+
+        for i in 0..=255 {
+            while let Err(e) = trie.insert(i, i as u64) {
+                if e.downcast::<HashedArrayTrieError>().unwrap() == HashedArrayTrieError::OutOfMemory {
+                    storage.borrow_mut().resize()?;
+                }
+            }
+        }
+        for i in 0..=255 {
+            assert_eq!(trie.get(i).expect("Failed to get key"), i as u64);
+        }
+    }
     Ok(())
 }
