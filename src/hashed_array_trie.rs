@@ -6,6 +6,7 @@ use eyre::Result;
 use memmap2::MmapMut;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::collections::HashSet;
 use std::default::Default;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -63,10 +64,10 @@ struct HashedArrayTrieFlags {
 
 impl HashedArrayTrieFlags {
     pub fn offset(&self, index: u8) -> usize {
-        (((self.mask() as u64) << (32 - index)) as u32).count_ones() as usize
+        (((self.0 & 0xFFFFFFFF) << (32 - index)) as u32).count_ones() as usize
     }
     pub fn count(&self) -> usize {
-        self.mask().count_ones() as usize
+        (self.mask()).count_ones() as usize
     }
     pub fn exists(&self, index: u8) -> bool {
         (self.mask() & (0b1 << index)) != 0
@@ -80,6 +81,48 @@ impl HashedArrayTrieFlags {
     }
     pub fn from_ref(target: &u64) -> &HashedArrayTrieFlags {
         unsafe { &*(target as *const u64).cast::<HashedArrayTrieFlags>() }
+    }
+
+    #[inline]
+    fn parity_location(&self) -> u8 {
+        // We hide the parity either in the skip count or in the skip bits depending on if skip count is 4 or not
+        if (self.0 & (1 << 43)) != 0 {
+            41
+        } else {
+            63
+        }
+    }
+    #[inline]
+    fn calc_parity(&self) -> u32 {
+        (self.0 & !(1 << self.parity_location())).count_ones() & 1
+    }
+    #[inline]
+    fn get_parity(&self) -> bool {
+        (self.0 & (1 << self.parity_location())) != 0
+    }
+    #[inline]
+    pub fn check_parity(&self) -> bool {
+        self.get_parity() == (self.calc_parity() != 0)
+    }
+    #[inline(never)]
+    pub fn set_parity(&mut self) {
+        let bit = 1 << self.parity_location();
+        let parity = (self.calc_parity() as u64) << self.parity_location();
+        self.0 = (self.0 & !bit) | parity;
+    }
+    pub fn is_valid(&self) -> bool {
+        // refcount should be greater than zero
+        self.refcount() > 0 &&
+        // parity bit should be valid
+        self.check_parity() &&
+        // should have a nonzero number of children (otherwise it's degenerate)
+        self.count() > 0 &&
+        // skipbits should be zero for all skiplevels we aren't using
+        if (self.skips() & 0b100) != 0 {
+            (self.skips() & 0b010) == 0
+        } else {
+            (self.skipbits() & !(1 << 19) & !((1 << (self.skips() * 5)) - 1)) == 0
+        }
     }
 }
 
@@ -151,6 +194,50 @@ fn test_offsets() {
     }
 }
 
+#[test]
+fn test_parity() {
+    let mut a = HashedArrayTrieFlags::new().with_refcount(0);
+
+    assert_eq!(a.0, 0);
+    assert_eq!(a.get_parity(), false);
+    assert_eq!(a.calc_parity(), 0);
+    assert_eq!(a.check_parity(), true);
+    a.set_parity();
+    assert_eq!(a.0, 0);
+    assert_eq!(a.get_parity(), false);
+    assert_eq!(a.calc_parity(), 0);
+    assert_eq!(a.check_parity(), true);
+
+    a.set_refcount(1);
+    assert_ne!(a.0, 0);
+    assert_eq!(a.get_parity(), false);
+    assert_eq!(a.calc_parity(), 1);
+    assert_eq!(a.check_parity(), false);
+    a.set_parity();
+    assert_eq!(a.get_parity(), true);
+    assert_eq!(a.calc_parity(), 1);
+    assert_eq!(a.check_parity(), true);
+
+    a.0 = 0;
+    assert_eq!(a.get_parity(), false);
+    a.set_skips(1);
+    assert_eq!(a.get_parity(), false);
+    a.set_skips(4);
+    assert_eq!(a.get_parity(), false);
+    a.set_skips(5);
+    assert_eq!(a.get_parity(), true);
+    a.set_skips(6);
+    assert_eq!(a.get_parity(), false);
+    a.set_skips(7);
+    assert_eq!(a.get_parity(), true);
+    a.set_skips(1);
+    assert_eq!(a.get_parity(), false);
+    a.set_skipbits(1 << 19);
+    assert_eq!(a.get_parity(), true);
+    a.set_skipbits(1 << 18);
+    assert_eq!(a.get_parity(), false);
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct HashedArrayTrieHeader {
@@ -164,7 +251,7 @@ pub struct HashedArrayStorage {
     handle: Option<File>,
     mapping: Option<MmapMut>,
     // TODO: Maybe replace with data structure that can maintain efficient merged intervals
-    //dirty_pages: Vec<usize>,
+    dirty_pages: HashSet<usize>,
 }
 
 const HEADER_BYTES: usize = size_of::<HashedArrayTrieHeader>();
@@ -230,7 +317,8 @@ impl HashedArrayStorage {
             header.clean = 0;
         }
 
-        // If init section fails, we will leave a file full of zeros, which is okay because that's considered invalid anyway.
+        // If init section fails, we will leave a file full of zeros, which is okay because that's considered invalid
+        // anyway.
         self.init_section(
             HEADER_BYTES + MAX_NODE_BYTES + size_of::<u64>(),
             self.mapping.as_ref().unwrap_unchecked().len(),
@@ -259,7 +347,7 @@ impl HashedArrayStorage {
             let mut result = HashedArrayStorage {
                 handle: Some(src),
                 mapping: Some(mapping),
-                //dirty_pages: Vec::new(),
+                dirty_pages: HashSet::new(),
             };
 
             result.init_self()?;
@@ -285,7 +373,7 @@ impl HashedArrayStorage {
             let mut result = HashedArrayStorage {
                 handle: None,
                 mapping: Some(mapping),
-                //dirty_pages: Vec::new(),
+                dirty_pages: HashSet::new(),
             };
 
             result.init_self()?;
@@ -318,13 +406,17 @@ impl HashedArrayStorage {
                         assert!(freelist[i] as usize + i + 1 < words.len());
                     }
 
-                    // If we have more than 1 extra space left over, assign it to different freelist instead of wasting it
+                    // If we have more than 1 extra space left over, assign it to different freelist instead of wasting
+                    // it
                     if count < i {
-                        // i is in terms of the index, which is the true size - 2 (MIN_NODE_SIZE), whereas count is the true size - 1
+                        // i is in terms of the index, which is the true size - 2 (MIN_NODE_SIZE), whereas count is the
+                        // true size - 1
                         let remainder = (i + 2) - (count + 1);
-                        // We express remainder in the true word size because we need at least 2 words to squeeze in 1 node (1 header + 1 data)
+                        // We express remainder in the true word size because we need at least 2 words to squeeze in 1
+                        // node (1 header + 1 data)
                         if remainder >= MIN_NODE_SIZE {
-                            // However, now that remainder is in the true word size, we have to subtract MIN_NODE_SIZE to get to the actual freelist index!
+                            // However, now that remainder is in the true word size, we have to subtract MIN_NODE_SIZE
+                            // to get to the actual freelist index!
                             let split_node = result as usize + count + 1;
                             words[split_node] = freelist[remainder - MIN_NODE_SIZE];
                             freelist[remainder - MIN_NODE_SIZE] = split_node as u64;
@@ -337,8 +429,8 @@ impl HashedArrayStorage {
         Err(HashedArrayTrieError::OutOfMemory.into())
     }
 
-    // Initializes a new section at the given byte offset by adding it to the freelist. We do this in reverse order so the freelist
-    // doesn't try to fill up the new section backwards.
+    // Initializes a new section at the given byte offset by adding it to the freelist. We do this in reverse order so
+    // the freelist doesn't try to fill up the new section backwards.
     fn init_section(&mut self, byte_offset: usize, byte_end: usize) -> Result<()> {
         if let Some(mapping) = self.mapping.as_mut() {
             unsafe {
@@ -347,7 +439,8 @@ impl HashedArrayStorage {
                 let header = &mut *(ptr as *mut HashedArrayTrieHeader);
                 let (prefix, slice, _) = unaligned.align_to_mut::<u64>();
                 if prefix.len() > 0 {
-                    // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which is very bad.
+                    // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which
+                    // is very bad.
                     return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
                 }
 
@@ -393,7 +486,7 @@ impl HashedArrayStorage {
             let mut storage = HashedArrayStorage {
                 mapping: Some(mapping),
                 handle: Some(src),
-                //dirty_pages: Vec::new(),
+                dirty_pages: HashSet::new(),
             };
 
             let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
@@ -416,19 +509,136 @@ impl HashedArrayStorage {
             Ok(storage)
         }
     }
+
     // Load a file - if it doesn't already exist or is invalid, returns an error
     pub fn load(path: &Path) -> Result<HashedArrayStorage> {
         Self::load_file(OpenOptions::new().read(true).write(true).create(false).open(&path)?)
     }
 
-    // Attempts to reconstruct a file that was not cleanly flushed.
-    pub fn restore(path: &Path) -> Result<HashedArrayStorage> {
-        // Because all our freelists have at least one 0 following them, no valid node should ever have zero children, and no legitimate offset should ever point
-        // at 0, we simply delete all nodes that are pointing to invalid sections of the file. An invalid section is anything pointing to 0, or pointing to any number
-        // followed by a 0.
+    fn scan_valid_nodes(offset: u64, words: &mut [u64], valid: &mut HashSet<u64>) -> bool {
+        let total_len = words.len() as u64;
+        if offset >= total_len {
+            return false;
+        }
 
-        // Once we do this, we reconstruct the freelists by scanning the entire file in reverse.
-        Err(eyre!("Not implemented"))
+        let offset = offset as usize;
+        // Ensure this node is consistent.
+        let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+
+        if !node.is_valid() {
+            return false;
+        }
+
+        if !node.leaf() {
+            // Check children for consistency. Remove any that have been corrupted.
+            let mut count = 0;
+            let mut valid_children = 0;
+            let mut children = [0; 32];
+            let mut mask = node.mask();
+            for i in 0..32 {
+                if (mask & (1 << i)) != 0 {
+                    if Self::scan_valid_nodes(words[offset + 1 + count], words, valid) {
+                        children[valid_children] = words[offset + 1 + count];
+                        valid_children += 1;
+                    } else {
+                        mask &= !(1 << i);
+                    }
+                    count += 1;
+                }
+            }
+
+            if valid_children == 0 {
+                return false;
+            }
+
+            // If we had some invalid children, we reconstruct the node with the valid ones
+            if valid_children != count {
+                words[offset + 1..(offset + 1 + count)].fill(0);
+                words[offset + 1..(offset + 1 + valid_children)].copy_from_slice(&children[..valid_children]);
+            }
+
+            assert_eq!(valid_children as u32, mask.count_ones());
+
+            let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset as usize]);
+            node.set_mask(mask);
+            node.set_parity();
+        } else if offset as u64 + node.count() as u64 >= total_len {
+            return false;
+        }
+
+        valid.insert(offset as u64);
+
+        true
+    }
+
+    // Attempts to reconstruct a file that was not cleanly flushed.
+    pub fn restore_file(src: File) -> Result<HashedArrayStorage> {
+        // We create a hashmap of all reachable, valid nodes starting from the root. Because all our freelists have at
+        // least one 0 following them, no valid node should ever have zero children, and no legitimate offset
+        // should ever point at 0, so an invalid section is anything pointing to 0, or pointing to a non-leaf
+        // node followed by a zero.
+
+        let fsize = src.metadata()?.len();
+        if fsize < HEADER_BYTES as u64 {
+            return Err(HashedArrayTrieError::FileTooSmall(HEADER_BYTES, fsize).into());
+        }
+
+        unsafe {
+            let mapping = MmapMut::map_mut(&src)?;
+            if mapping.len() < HEADER_BYTES {
+                return Err(HashedArrayTrieError::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
+            }
+            let mut storage = HashedArrayStorage {
+                mapping: Some(mapping),
+                handle: Some(src),
+                dirty_pages: HashSet::new(),
+            };
+
+            let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
+            let prefix = slice.align_to::<u64>().0;
+            if prefix.len() > 0 {
+                return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            }
+
+            // Clean the header out, setting root to 1 if it's invalid and wiping the freelist.
+            let (header, words) = storage.parts_mut();
+            header.clean = 0;
+            if header.root as usize > words.len() {
+                header.root = 1;
+            }
+            header.freelist.fill(u64::MAX);
+
+            let mut validnodes = HashSet::new();
+            Self::scan_valid_nodes(header.root, words, &mut validnodes);
+
+            words[0] = u64::MAX;
+            let mut count = 0;
+            // Now we reconstruct the freelists by scanning the entire file in reverse.
+            for i in (1..words.len() as u64).rev() {
+                let valid = validnodes.contains(&i);
+                if !valid {
+                    count += 1;
+                }
+                if valid || count >= MAX_NODE_SIZE {
+                    assert!(count <= MAX_NODE_SIZE);
+                    if count >= MIN_NODE_SIZE {
+                        words[i as usize] = header.freelist[count - MIN_NODE_SIZE];
+                        header.freelist[count - MIN_NODE_SIZE] = i;
+                    }
+
+                    count = 0;
+                }
+            }
+
+            // Now that we've recovered the file, flush the whole thing, keeping clean at 0 since we haven't closed it
+            // yet.
+            storage.mapping.as_mut().unwrap_unchecked().flush()?;
+            Ok(storage)
+        }
+    }
+
+    pub fn restore(path: &Path) -> Result<HashedArrayStorage> {
+        Self::restore_file(OpenOptions::new().read(true).write(true).create(false).open(&path)?)
     }
 
     #[cfg(target_os = "linux")]
@@ -498,20 +708,24 @@ where
         }
     }
 
-    // DOES NOT INCREMENT REFCOUNTS. This is to enable the mutable fast-path, which will immediately delete the source node.
+    // DOES NOT INCREMENT REFCOUNTS. This is to enable the mutable fast-path, which will immediately delete the source
+    // node.
     #[inline]
     fn clone_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
-        // TODO: this uses memmove, these should never overlap so a copy is slightly faster but it might not matter for small sizes
+        // TODO: this uses memmove, these should never overlap so a copy is slightly faster but it might not matter for
+        // small sizes
         words.copy_within(from..(from + count + 1), to as usize)
     }
 
-    // This fixes the refcounts of the children in a node cloned via clone_node. Doesn't check if it's a leaf node or not!
+    // This fixes the refcounts of the children in a node cloned via clone_node. Doesn't check if it's a leaf node or
+    // not!
     #[inline]
     fn fix_node_refcount(node: usize, words: &mut [u64]) {
         let count = HashedArrayTrieFlags::from_ref(&words[node]).count();
         for i in (node + 1)..=(node + count) {
             let flags = HashedArrayTrieFlags::from_ref_mut(&mut words[words[i] as usize]);
             flags.set_refcount(flags.refcount() + 1);
+            flags.set_parity();
         }
     }
 
@@ -520,7 +734,9 @@ where
         words[offset] |= 0b1 << index;
         words[offset + count + 1] = value;
 
-        let indice = (((words[offset] & 0xFFFFFFFF) << (32 - index)) as u32).count_ones() as usize;
+        let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+        node.set_parity();
+        let indice = node.offset(index);
 
         // Do up to N swaps (going backwards) to get the value in the right cell
         for i in (indice..count).rev() {
@@ -530,8 +746,9 @@ where
 
     #[inline]
     fn remove(offset: usize, words: &mut [u64], index: u8, count: usize) -> u64 {
-        let indice = (((words[offset] & 0xFFFFFFFF) << (32 - index)) as u32).count_ones() as usize;
+        let indice = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]).offset(index);
         words[offset] &= !(0b1 << index);
+        HashedArrayTrieFlags::from_ref_mut(&mut words[offset]).set_parity();
 
         // Do up to N swaps (going forwards) to get the value we removed to the end
         for i in indice..(count - 1) {
@@ -601,6 +818,7 @@ where
             header.freelist[count - 1] = offset as u64;
         } else {
             node.set_refcount(node.refcount() - 1);
+            node.set_parity();
         }
 
         Ok(())
@@ -667,7 +885,8 @@ where
 
                         Ok(0)
                     } else {
-                        // Otherwise, we have to properly increment the refcounts of the cloned node, then clone ourselves
+                        // Otherwise, we have to properly increment the refcounts of the cloned node, then clone
+                        // ourselves
                         let clone = store.allocate(count)?;
                         let words = store.words_mut();
                         if bits - 5 > 5 {
@@ -685,9 +904,13 @@ where
                     Ok(0)
                 }
             } else {
-                // Create a new child node that is empty and recurse into it. We force it to be mutable, so it shouldn't return anything.
+                // Create a new child node that is empty and recurse into it. We force it to be mutable, so it shouldn't
+                // return anything.
                 let child = store.allocate(1)?;
-                store.words_mut()[child as usize] = HashedArrayTrieFlags::new().with_refcount(1).into();
+                store.words_mut()[child as usize] = HashedArrayTrieFlags::new()
+                    .with_refcount(1)
+                    .with_leaf(bits <= 10)
+                    .into();
                 let n = Self::insert_node(child as usize, store, bits - 5, key, value, true)?;
                 assert_eq!(n, 0);
 
