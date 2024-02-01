@@ -269,13 +269,14 @@ impl HashedArrayStorage {
     }
 
     #[inline]
-    fn parts_mut(&mut self) -> (&mut HashedArrayTrieHeader, &mut [u64]) {
+    fn parts_mut(&mut self) -> (&mut HashedArrayTrieHeader, &mut [u64], &mut HashSet<usize>) {
         (
             unsafe { &mut *(self.mapping.as_mut().unwrap_unchecked().as_mut_ptr() as *mut HashedArrayTrieHeader) },
             unsafe {
                 let slice = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..];
                 std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u64, slice.len() / size_of::<u64>())
             },
+            &mut self.dirty_pages,
         )
     }
     #[inline]
@@ -310,7 +311,7 @@ impl HashedArrayStorage {
         slice[1] = HashedArrayTrieFlags::new().with_refcount(1).into();
 
         {
-            let (header, _) = self.parts_mut();
+            let (header, _, _) = self.parts_mut();
 
             // Initialize freelist and dirty clean value
             header.freelist.fill(u64::MAX);
@@ -396,7 +397,7 @@ impl HashedArrayStorage {
         assert!(count > 0);
         assert!(count <= 32);
         if self.mapping.is_some() {
-            let (header, words) = self.parts_mut();
+            let (header, words, hash) = self.parts_mut();
             let freelist = &mut header.freelist;
             for i in (count - 1)..MAX_CHILDREN {
                 if freelist[i] != u64::MAX {
@@ -405,6 +406,8 @@ impl HashedArrayStorage {
                     if freelist[i] != u64::MAX {
                         assert!(freelist[i] as usize + i + 1 < words.len());
                     }
+                    Self::mark(hash, result);
+                    Self::mark(hash, result + count as u64 + 1);
 
                     // If we have more than 1 extra space left over, assign it to different freelist instead of wasting
                     // it
@@ -494,7 +497,7 @@ impl HashedArrayStorage {
             if prefix.len() > 0 {
                 return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
             }
-            let (header, _) = storage.parts_mut();
+            let (header, _, _) = storage.parts_mut();
             if header.clean == 0 {
                 return Err(HashedArrayTrieError::DirtyTrieState.into());
             }
@@ -601,7 +604,7 @@ impl HashedArrayStorage {
             }
 
             // Clean the header out, setting root to 1 if it's invalid and wiping the freelist.
-            let (header, words) = storage.parts_mut();
+            let (header, words, _) = storage.parts_mut();
             header.clean = 0;
             if header.root as usize > words.len() {
                 header.root = 1;
@@ -680,9 +683,28 @@ impl HashedArrayStorage {
 
     pub fn flush(&mut self) -> Result<()> {
         if let Some(mapping) = self.mapping.as_mut() {
-            mapping.flush()?;
+            //mapping.flush()?;
+            let mut pages: Vec<usize> = self.dirty_pages.drain().collect();
+            pages.sort_unstable();
+
+            let mut start = 0;
+            let mut end = 0;
+            for i in pages {
+                if i == end || end + 1 == i {
+                    end = i;
+                } else {
+                    //mapping.flush_range(start * PAGE_SIZE, (end - start + 1) * PAGE_SIZE)?;
+                    start = i;
+                    end = i;
+                }
+            }
+            //mapping.flush_range(start * PAGE_SIZE, (end - start + 1) * PAGE_SIZE)?;
         }
         Ok(())
+    }
+
+    pub fn mark(hash: &mut HashSet<usize>, word: u64) {
+        //hash.insert(((word * size_of::<u64>() as u64 + HEADER_BYTES as u64) / PAGE_SIZE as u64) as usize);
     }
 }
 
@@ -780,6 +802,7 @@ where
         bits: usize,
         header: &mut HashedArrayTrieHeader,
         words: &mut [u64],
+        dirty_pages: &mut HashSet<usize>,
         recurse: bool,
     ) -> Result<()> {
         assert_ne!(words[offset], 0);
@@ -794,7 +817,7 @@ where
                 // Decrement and (if necessary) delete any children we have, UNLESS we are a leaf node.
                 if bits > 5 {
                     for i in 1..=count {
-                        Self::delete_checked(words[offset + i] as usize, bits - 5, header, words, true)?;
+                        Self::delete_checked(words[offset + i] as usize, bits - 5, header, words, dirty_pages, true)?;
                     }
                 }
             }
@@ -816,9 +839,14 @@ where
             // Add it on to the appropriate freelist (0th index has 1 node, so  we use count - 1)
             words[offset] = header.freelist[count - 1];
             header.freelist[count - 1] = offset as u64;
+
+            HashedArrayStorage::mark(dirty_pages, offset as u64);
+            HashedArrayStorage::mark(dirty_pages, (offset + 1 + count) as u64);
         } else {
             node.set_refcount(node.refcount() - 1);
             node.set_parity();
+
+            HashedArrayStorage::mark(dirty_pages, offset as u64);
         }
 
         Ok(())
@@ -839,6 +867,9 @@ where
         // If we are mutable and we have space, we just append the child and return nothing
         if mutable && offset + count + 1 < store.words().len() && store.words()[offset + count + 1] == 0 {
             Self::append(offset, store.words_mut(), index, value, count);
+            HashedArrayStorage::mark(&mut store.dirty_pages, offset as u64);
+            HashedArrayStorage::mark(&mut store.dirty_pages, (offset + count + 1) as u64);
+
             Ok(0)
         } else {
             // Otherwise, we must clone ourselves
@@ -876,13 +907,14 @@ where
                 // If it returns a new node, that means it replaced itself.
                 if n != 0 {
                     if mutable {
-                        let (header, words) = store.parts_mut();
+                        let (header, words, hash) = store.parts_mut();
                         // In this case, we can delete the old node without touching the refcounts of the new one
-                        Self::delete_checked(child as usize, bits - 5, header, words, false)?;
+                        Self::delete_checked(child as usize, bits - 5, header, words, hash, false)?;
 
                         // Then we point to the new node offset
                         words[child_offset] = n;
 
+                        HashedArrayStorage::mark(&mut store.dirty_pages, child_offset as u64);
                         Ok(0)
                     } else {
                         // Otherwise, we have to properly increment the refcounts of the cloned node, then clone
@@ -943,8 +975,9 @@ where
         let n = Self::insert_node(offset, &mut store, bits, key, value, mutable)?;
         if n != 0 {
             // We reacquire root here after the call so that Rust doesn't think we require two borrows at the same time
-            let (_, words) = store.parts_mut();
+            let (_, words, hash) = store.parts_mut();
             let root = HashedArrayTrieFlags::from_ref(&words[offset]);
+
             if root.refcount() > 1 {
                 Self::fix_node_refcount(n as usize, words);
                 return Ok(Some(HashedArrayTrie {
@@ -954,7 +987,11 @@ where
                 }));
             } else {
                 let index: u8 = key.shr(bits - 5).as_() & 0b11111;
-                Self::append(offset, words, index, n, root.count());
+                let count = root.count();
+                Self::append(offset, words, index, n, count);
+
+                HashedArrayStorage::mark(hash, offset as u64);
+                HashedArrayStorage::mark(hash, (offset + count + 1) as u64);
             }
         }
 
@@ -1022,10 +1059,10 @@ where
             let value = Self::delete_node(child, store, bits - 5, key)?;
 
             if HashedArrayTrieFlags::from_ref(&store.words()[child]).count() == 0 {
-                let (header, words) = store.parts_mut();
+                let (header, words, hash) = store.parts_mut();
                 let check = Self::remove(offset, words, index, count);
                 assert_eq!(check, child as u64);
-                Self::delete_checked(child, bits - 5, header, words, true)?;
+                Self::delete_checked(child, bits - 5, header, words, hash, true)?;
             }
 
             Ok(value)
@@ -1043,8 +1080,10 @@ where
             }
 
             let count = node.count();
-            let (_, words) = store.parts_mut();
+            let (_, words, hash) = store.parts_mut();
             let value = Self::remove(offset, words, index, count);
+            HashedArrayStorage::mark(hash, offset as u64);
+            HashedArrayStorage::mark(hash, (offset + 1 + count) as u64);
             Ok(value)
         }
     }
@@ -1061,7 +1100,7 @@ where
 impl Drop for HashedArrayStorage {
     fn drop(&mut self) {
         // Set our clean close bit to 1 and flush.
-        let (header, _) = self.parts_mut();
+        let (header, _, _) = self.parts_mut();
         header.clean = 1;
         // We have to ignore any errors here because we're already in the process of closing everything.
         let _ = self.flush();
