@@ -315,6 +315,7 @@ impl HashedArrayStorage {
             // Initialize freelist and dirty clean value
             header.freelist.fill(u64::MAX);
             header.clean = 0;
+            header.root = 1;
         }
 
         // If init section fails, we will leave a file full of zeros, which is okay because that's considered invalid
@@ -562,11 +563,17 @@ impl HashedArrayStorage {
             let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset as usize]);
             node.set_mask(mask);
             node.set_parity();
+
+            for i in 0..=node.count() {
+                valid.insert((offset + i) as u64);
+            }
         } else if offset as u64 + node.count() as u64 >= total_len {
             return false;
+        } else {
+            for i in 0..=node.count() {
+                valid.insert((offset + i) as u64);
+            }
         }
-
-        valid.insert(offset as u64);
 
         true
     }
@@ -603,7 +610,7 @@ impl HashedArrayStorage {
             // Clean the header out, setting root to 1 if it's invalid and wiping the freelist.
             let (header, words) = storage.parts_mut();
             header.clean = 0;
-            if header.root as usize > words.len() {
+            if header.root == 0 || header.root as usize > words.len() {
                 header.root = 1;
             }
             header.freelist.fill(u64::MAX);
@@ -614,16 +621,20 @@ impl HashedArrayStorage {
             words[0] = u64::MAX;
             let mut count = 0;
             // Now we reconstruct the freelists by scanning the entire file in reverse.
-            for i in (1..words.len() as u64).rev() {
+            for i in (34..words.len() as u64).rev() {
                 let valid = validnodes.contains(&i);
-                if !valid {
+                let target = if !valid {
                     count += 1;
-                }
+                    i
+                } else {
+                    i + 1
+                };
+
                 if valid || count >= MAX_NODE_SIZE {
                     assert!(count <= MAX_NODE_SIZE);
                     if count >= MIN_NODE_SIZE {
-                        words[i as usize] = header.freelist[count - MIN_NODE_SIZE];
-                        header.freelist[count - MIN_NODE_SIZE] = i;
+                        words[target as usize] = header.freelist[count - MIN_NODE_SIZE];
+                        header.freelist[count - MIN_NODE_SIZE] = target;
                     }
 
                     count = 0;
@@ -681,6 +692,13 @@ impl HashedArrayStorage {
     pub fn flush(&mut self) -> Result<()> {
         if let Some(mapping) = self.mapping.as_mut() {
             mapping.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_async(&mut self) -> Result<()> {
+        if let Some(mapping) = self.mapping.as_mut() {
+            mapping.flush_async()?;
         }
         Ok(())
     }
@@ -1375,5 +1393,60 @@ fn test_allocations() -> Result<()> {
             assert_eq!(trie.get(i).expect("Failed to get key"), i as u64);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_storage_restore_simple() -> Result<()> {
+    let fileref = tempfile()?;
+
+    {
+        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_ref(&fileref, 296)?));
+        let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
+
+        trie.insert(1, 1).expect("Insertion failure!");
+        assert_eq!(trie.get(1).expect("Failed to get key"), 1);
+    }
+
+    {
+        let storage = Rc::new(RefCell::new(HashedArrayStorage::restore_file(fileref)?));
+        let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
+        assert_eq!(trie.get(1).expect("Failed to get key"), 1);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_storage_restore() -> Result<()> {
+    let fileref = tempfile()?;
+
+    {
+        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_ref(&fileref, 1 << 16)?));
+        let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
+        // Fill an 8-bit trie with with every single possible key
+        let mut v: Vec<u8> = (0..=u8::MAX).collect();
+
+        //let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = thread_rng();
+        v.shuffle(&mut rng);
+        for i in &v {
+            trie.insert(*i, *i as u64).expect("Insertion failure!");
+        }
+
+        for i in 0..=u8::MAX {
+            assert_eq!(trie.get(i).expect("Failed to get key"), i as u64);
+        }
+    }
+
+    {
+        let storage = Rc::new(RefCell::new(HashedArrayStorage::restore_file(fileref)?));
+        let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
+
+        for i in 0..=u8::MAX {
+            assert_eq!(trie.get(i).expect("Failed to get key"), i as u64);
+        }
+    }
+
     Ok(())
 }
