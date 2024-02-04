@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use bitfield_struct::bitfield;
-use eyre::eyre;
 use eyre::Result;
 use memmap2::MmapMut;
 use std::cell::RefCell;
@@ -653,14 +652,27 @@ impl HashedArrayStorage {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn resize(&self) -> Result<()> {
+    pub fn resize(&mut self) -> Result<()> {
         self.flush()?;
-        if let Some(m) = self.mapping {
-            let new_size = m.len() * 2;
+        if let Some(m) = &mut self.mapping {
+            let old_size = m.len();
+            let new_size = old_size * 2;
             if let Some(handle) = self.handle.as_ref() {
-                handle.set_len(new_size as u64);
+                handle.set_len(new_size as u64)?;
+
+                unsafe {
+                    if let Err(e) = m.remap(new_size, memmap2::RemapOptions::new().may_move(true))
+                    {
+                        drop(m);
+                        if let Some(handle) = self.handle.as_ref() {
+                            handle.set_len(new_size as u64)?;
+            
+                            self.mapping = Some(MmapMut::map_mut(handle)?);
+                        }
+                    }
+                    self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
+                }
             }
-            m.remap(new_size, MmapMut::RemapOptions::may_move)?;
             return Ok(());
         }
 
