@@ -1,7 +1,6 @@
 // Vendored from: https://github.com/pythonesque/fallthrough
 // It's untouched, generates warnings, and hasn't been published on crates.io
 // but it saves 5% or so on benchmarking.
-
 #[macro_export]
 macro_rules! match_fallthrough_make_match {
     ($elem:expr, ($($pat:pat => $branch:expr)*)) => {{
@@ -34,6 +33,7 @@ macro_rules! match_fallthrough_make_loops {
     }};
 }
 
+#[allow(unreachable_code)]
 #[macro_export]
 macro_rules! match_fallthrough_reverse_branches {
     ($test:expr, ($pat:pat => $branch:expr); ($($p:pat => $r:expr)*)) => {{

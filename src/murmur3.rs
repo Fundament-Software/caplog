@@ -1,12 +1,12 @@
 // Based on the fastmurmur3 crate, but modified to work on a generic Read trait
 
 use crate::{
-    match_fallthrough, match_fallthrough_make_loops, match_fallthrough_make_match,
-    match_fallthrough_reverse_branches,
+    match_fallthrough, match_fallthrough_make_loops, match_fallthrough_make_match, match_fallthrough_reverse_branches,
 };
 use std::io::Read;
 use std::ops::Shl;
 
+#[allow(unreachable_code)]
 #[inline]
 pub fn murmur3_stream<R>(mut data: R, len: usize, seed: u64) -> Result<u128, std::io::Error>
 where
@@ -29,7 +29,7 @@ where
     let mut buf: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
 
     while trailing_len >= BLOCK_SIZE {
-        data.read_exact(&mut buf);
+        data.read_exact(&mut buf)?;
         trailing_len -= BLOCK_SIZE;
 
         let k1 = u64::from_le_bytes(unsafe { *(buf.as_ptr() as *const [u8; HALF_BLOCK_SIZE]) });
@@ -37,17 +37,9 @@ where
             *(buf.as_ptr().offset(HALF_BLOCK_SIZE as isize) as *const [u8; HALF_BLOCK_SIZE])
         });
         h1 ^= k1.wrapping_mul(C1).rotate_left(R2).wrapping_mul(C2);
-        h1 = h1
-            .rotate_left(R1)
-            .wrapping_add(h2)
-            .wrapping_mul(M)
-            .wrapping_add(C3);
+        h1 = h1.rotate_left(R1).wrapping_add(h2).wrapping_mul(M).wrapping_add(C3);
         h2 ^= k2.wrapping_mul(C2).rotate_left(R3).wrapping_mul(C1);
-        h2 = h2
-            .rotate_left(R2)
-            .wrapping_add(h1)
-            .wrapping_mul(M)
-            .wrapping_add(C4);
+        h2 = h2.rotate_left(R2).wrapping_add(h1).wrapping_mul(M).wrapping_add(C4);
     }
 
     data.read_exact(&mut buf[..trailing_len])?;
@@ -94,9 +86,7 @@ where
     h2 = fmix64(h2);
     h1 = h1.wrapping_add(h2);
     h2 = h2.wrapping_add(h1);
-    Ok(u128::from_ne_bytes(unsafe {
-        *([h1, h2].as_ptr() as *const [u8; 16])
-    }))
+    Ok(u128::from_ne_bytes(unsafe { *([h1, h2].as_ptr() as *const [u8; 16]) }))
 }
 
 trait XorShift {
@@ -113,11 +103,7 @@ fn fmix64(k: u64) -> u64 {
     const C1: u64 = 0xff51_afd7_ed55_8ccd;
     const C2: u64 = 0xc4ce_b9fe_1a85_ec53;
     const R: u32 = 33;
-    k.xor_shr(R)
-        .wrapping_mul(C1)
-        .xor_shr(R)
-        .wrapping_mul(C2)
-        .xor_shr(R)
+    k.xor_shr(R).wrapping_mul(C1).xor_shr(R).wrapping_mul(C2).xor_shr(R)
 }
 
 #[cfg(test)]
@@ -138,6 +124,7 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_agreement_fuzzed() {
         let mut rng = rand::thread_rng();
 
