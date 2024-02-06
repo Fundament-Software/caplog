@@ -709,34 +709,6 @@ impl HashedArrayStorage {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[cfg(not(miri))]
-    pub fn resize(&mut self) -> Result<()> {
-        self.flush()?;
-        if let Some(m) = &mut self.mapping {
-            let old_size = m.len();
-            let new_size = old_size * 2;
-            if let Some(handle) = self.handle.as_ref() {
-                handle.set_len(new_size as u64)?;
-
-                unsafe {
-                    if let Err(e) = m.remap(new_size, memmap2::RemapOptions::new().may_move(true)) {
-                        drop(m);
-                        if let Some(handle) = self.handle.as_ref() {
-                            handle.set_len(new_size as u64)?;
-
-                            self.mapping = Some(MmapMut::map_mut(handle)?);
-                        }
-                    }
-                    self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
-                }
-            }
-            return Ok(());
-        }
-
-        Err(HashedArrayTrieError::OutOfMemory.into())
-    }
-
     #[cfg(miri)]
     pub fn resize(&mut self) -> Result<()> {
         if let Some(mapref) = &mut self.mapping {
@@ -763,6 +735,34 @@ impl HashedArrayStorage {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(miri))]
+    pub fn resize(&mut self) -> Result<()> {
+        self.flush()?;
+        if let Some(m) = &mut self.mapping {
+            let old_size = m.len();
+            let new_size = old_size * 2;
+            if let Some(handle) = self.handle.as_ref() {
+                handle.set_len(new_size as u64)?;
+
+                unsafe {
+                    if let Err(e) = m.remap(new_size, memmap2::RemapOptions::new().may_move(true)) {
+                        drop(m);
+                        if let Some(handle) = self.handle.as_ref() {
+                            handle.set_len(new_size as u64)?;
+
+                            self.mapping = Some(MmapMut::map_mut(handle)?);
+                        }
+                    }
+                    self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
+                }
+            }
+            return Ok(());
+        }
+
+        Err(HashedArrayTrieError::OutOfMemory(0).into())
     }
 
     #[cfg(not(target_os = "linux"))]

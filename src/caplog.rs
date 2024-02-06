@@ -282,11 +282,7 @@ impl CapLog {
         self.get_message(
             header.data,
             header.length,
-            if integrity_check {
-                Some(header.hash)
-            } else {
-                None
-            },
+            if integrity_check { Some(header.hash) } else { None },
         )
     }
 
@@ -359,15 +355,8 @@ impl CapLog {
             offset,
             length,
             hash,
-            |s: &CapLog, slice: &[u8]| {
-                Ok(capnp::serialize_packed::read_message(
-                    Cursor::new(slice),
-                    s.options,
-                )?)
-            },
-            |s: &CapLog, reader: BufReader<File>, _: u64| {
-                Ok(capnp::serialize_packed::read_message(reader, s.options)?)
-            },
+            |s: &CapLog, slice: &[u8]| Ok(capnp::serialize_packed::read_message(Cursor::new(slice), s.options)?),
+            |s: &CapLog, reader: BufReader<File>, _: u64| Ok(capnp::serialize_packed::read_message(reader, s.options)?),
         )
     }
 
@@ -403,10 +392,7 @@ impl CapLog {
     }
     pub fn append(&mut self, id: u64, machine_id: u64, schema: u64, data: &[u8]) -> Result<()> {
         // We do a sanity check here in case the files are empty or the error bit is set.
-        if self.data_file.is_none()
-            || self.header_file.is_none()
-            || self.error_flag.load(Ordering::Relaxed)
-        {
+        if self.data_file.is_none() || self.header_file.is_none() || self.error_flag.load(Ordering::Relaxed) {
             return Err(eyre!("Log filesystem is in bad state!"));
         }
 
