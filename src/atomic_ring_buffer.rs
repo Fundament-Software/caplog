@@ -56,8 +56,7 @@ where
         let length = src.len();
 
         // We do a check first to avoid unnecessarily hammering a filled buffer (atomic ordering doesn't matter here)
-        if (self.tail.load(Ordering::Relaxed) + length) > (self.head.load(Ordering::Relaxed) + SIZE)
-        {
+        if (self.tail.load(Ordering::Relaxed) + length) > (self.head.load(Ordering::Relaxed) + SIZE) {
             return Err(eyre!("Not enough space!"));
         }
 
@@ -77,15 +76,11 @@ where
                 self.buf[..(end % SIZE)].copy_from_slice(&src[(SIZE - begin)..]);
             }
 
-            // We now need to commit our copy operation. If we finished before a previous write, we spin until it finishes
+            // We now need to commit our copy operation. If we finished before a previous write, we spin until it
+            // finishes
             while self
                 .write_marker
-                .compare_exchange_weak(
-                    begin_unbounded,
-                    end_unbounded,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(begin_unbounded, end_unbounded, Ordering::Release, Ordering::Relaxed)
                 .is_err()
             {
                 std::hint::spin_loop();
