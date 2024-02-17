@@ -810,7 +810,7 @@ pub struct HashedArrayTrie<K>
 where
     K: num::PrimInt,
 {
-    storage: Rc<RefCell<HashedArrayStorage>>,
+    pub storage: Rc<RefCell<HashedArrayStorage>>,
     offset: u64,
     phantomkey: PhantomData<K>,
 }
