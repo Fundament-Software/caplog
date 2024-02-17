@@ -1,20 +1,25 @@
-use crate::atomic_ring_buffer::AtomicRingBuffer;
+use crate::log_capnp::{log_entry, log_sink};
+use crate::ring_buf_writer::RingBufWriter;
 
+use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie};
 use super::murmur3::murmur3_stream;
 use super::sorted_map::SortedMap;
-use capnp::io::Write;
-use capnp::message;
 use capnp::message::ReaderOptions;
+use capnp::{data, message};
 use eyre::eyre;
 use eyre::Result;
-use std::collections::HashMap;
+use std::alloc;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::Cursor;
-use std::io::Seek;
-use std::io::{BufReader, Read};
+use std::io::BufReader;
+use std::io::{Cursor, Seek, Write};
+use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -29,99 +34,38 @@ pub enum CapLogError {
     CorruptData(u128, u128),
     #[error("the data for key `{0}` is not available")]
     NotFound(String),
+    #[error("Tried to allocate a buffer for {0} bytes but only had {1} left")]
+    NotEnoughBuffer(usize, usize),
+    #[error("File I/O error encountered or filesystem in bad state")]
+    FileError,
     #[error("unknown caplog error")]
     Unknown,
 }
 
-#[derive(Clone, Debug, Copy, Default)]
-pub struct HeaderBlock {
-    id: u64,
-    schema: u64,
-    data: u64,
-    length: u64,
-    hash: u128,
-}
-
-impl HeaderBlock {
-    const BYTESIZE: usize = (u64::BITS * 6) as usize / 8;
-
-    #[inline]
-    pub fn new(bytes: &[u8]) -> Result<HeaderBlock> {
-        if bytes.len() < Self::BYTESIZE as usize {
-            return Err(CapLogError::OutOfBounds {
-                v: bytes.len() as u64,
-                minimum: Self::BYTESIZE as u64,
-                maximum: u64::MAX,
-            }
-            .into());
-        }
-        Ok(HeaderBlock {
-            id: u64::from_le_bytes(bytes[0..8].try_into()?),
-            schema: u64::from_le_bytes(bytes[8..16].try_into()?),
-            data: u64::from_le_bytes(bytes[16..24].try_into()?),
-            length: u64::from_le_bytes(bytes[24..32].try_into()?),
-            hash: u128::from_le_bytes(bytes[32..48].try_into()?),
-        })
-    }
-
-    #[inline]
-    pub fn write<T>(&self, target: &mut T) -> Result<()>
-    where
-        T: std::io::Write,
-    {
-        target.write_all(&u64::to_le_bytes(self.id))?;
-        target.write_all(&u64::to_le_bytes(self.schema))?;
-        target.write_all(&u64::to_le_bytes(self.data))?;
-        target.write_all(&u64::to_le_bytes(self.length))?;
-        target.write_all(&u128::to_le_bytes(self.hash))?;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn write_bytes(&self, target: &mut [u8]) {
-        target[0..8].copy_from_slice(&u64::to_le_bytes(self.id));
-        target[8..16].copy_from_slice(&u64::to_le_bytes(self.id));
-        target[16..24].copy_from_slice(&u64::to_le_bytes(self.id));
-        target[24..32].copy_from_slice(&u64::to_le_bytes(self.id));
-        target[32..48].copy_from_slice(&u64::to_le_bytes(self.id));
-    }
-}
-
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum HeaderFlags {
-    Sorted = 0b001,
-    Finalized = 0b010, // We can still add things to a "finalized" file, we just have then recalculate the start section
-    ValidHash = 0b100, // Hash is never valid if we are actively adding things
+    Clean = 0b001, // If this isn't set, we didn't do a clean shutdown
 }
 
+#[repr(C)]
 #[derive(Clone, Debug, Copy, Default)]
 struct HeaderStart {
-    blocks: u64, // number of header blocks NOT including this one, so should be (file size / sizeof(HeaderBlock)) - 1
-    begin: u64,
-    end: u64,
     flags: u64,
-    digest: u128, // Hash of the entire rest of the file
 }
 
 impl HeaderStart {
-    const BYTESIZE: usize = (u64::BITS * 6) as usize / 8;
-
     #[inline]
     pub fn new(bytes: &[u8]) -> Result<HeaderStart> {
-        if bytes.len() < Self::BYTESIZE {
+        if bytes.len() < size_of::<HeaderStart>() {
             return Err(CapLogError::OutOfBounds {
                 v: bytes.len() as u64,
-                minimum: Self::BYTESIZE as u64,
+                minimum: size_of::<HeaderStart>() as u64,
                 maximum: u64::MAX,
             }
             .into());
         }
         Ok(HeaderStart {
-            blocks: u64::from_le_bytes(bytes[0..8].try_into()?),
-            begin: u64::from_le_bytes(bytes[8..16].try_into()?),
-            end: u64::from_le_bytes(bytes[16..24].try_into()?),
-            flags: u64::from_le_bytes(bytes[24..32].try_into()?),
-            digest: u128::from_le_bytes(bytes[32..48].try_into()?),
+            flags: u64::from_le_bytes(bytes[0..8].try_into()?),
         })
     }
 
@@ -130,33 +74,22 @@ impl HeaderStart {
     where
         T: std::io::Write,
     {
-        target.write_all(&u64::to_le_bytes(self.blocks))?;
-        target.write_all(&u64::to_le_bytes(self.begin))?;
-        target.write_all(&u64::to_le_bytes(self.end))?;
         target.write_all(&u64::to_le_bytes(self.flags))?;
-        target.write_all(&u128::to_le_bytes(self.digest))?;
         Ok(())
     }
 }
 
-// Ensure headerblock and headerstart are the same size
-const _: fn() = || {
-    let _ = std::mem::transmute::<HeaderBlock, HeaderStart>;
-};
-
 /// Maximum size of a data file. When this is reached, both the header file and data file are finalized,
 /// the in-memory vectors cleared, and a new data and header file are created
-const MAX_DATA_SIZE: u64 = 2_u64.pow(28);
+const MAX_FILE_SIZE: u64 = 2_u64.pow(28);
 const MAX_BUFFER_SIZE: usize = 2_usize.pow(22);
 const MAX_HEADER_SIZE: usize = MAX_BUFFER_SIZE / 32;
-const FILE_KEEPALIVE: u64 = 10000; // milliseconds of inactivity to keep a file open for lookup operations.
-const FILE_SORTDELAY: u64 = FILE_KEEPALIVE; // milliseconds of inactivity before sorting a header block file.
+const MAX_OPEN_FILES: usize = 10;
 
 #[derive(Debug)]
 struct FileManagement {
-    keepalive: u64,
-    sortdelay: u64,
-    files: SortedMap<u64, Option<File>>,
+    max_open_files: usize,
+    files: SortedMap<u128, Option<RingBufWriter<File, 4096>>>,
 }
 
 impl FileManagement {
@@ -166,124 +99,154 @@ impl FileManagement {
     }
 }
 
+struct StagingAlloc {
+    staging: Box<[u64]>,
+    staging_used: bool,
+}
+
 /// A high-performance append-only log
-#[derive(Debug)]
 pub struct CapLog {
-    header_prefix: PathBuf,
-    data_prefix: PathBuf,
-    max_data_size: u64,
-    header_file: Option<File>, // These CAN be empty if filesystem errors occur, such as the disk being full or a read-only filesystem due a degraded RAID state.
-    data_file: Option<File>,
+    max_file_size: u64,
+    trie: HashedArrayTrie<u128>,
     //schemas: HashMap<u64, Vec<u8>>,
-    header_count: u64,
-    data_offset: u64,
-    headers: AtomicRingBuffer<u8, MAX_BUFFER_SIZE>, // This stores already serialized bytes ready to be dumped into a file.
-    data: AtomicRingBuffer<u8, MAX_BUFFER_SIZE>,
-    finalizing: AtomicBool,
-    error_flag: AtomicBool, // This is set if there is a failure writing data to disk, which forces all pending writes to return errors
-    pending_count: AtomicU64,
+    staging: StagingAlloc,
+    data_prefix: PathBuf,
+    data_file: Option<RingBufWriter<File, MAX_BUFFER_SIZE>>,
+    data_position: u64,
+    flush_error: AtomicBool, // This is set if there is a failure writing data to disk, which forces all pending writes to return errors
+    last_flush: u64,
+    current_id: u128,
     archive: FileManagement,
     options: ReaderOptions,
+    pending: VecDeque<(u64, SyncSender<bool>)>,
+}
+
+unsafe impl<'a> capnp::message::Allocator for StagingAlloc {
+    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
+        assert!(minimum_size as usize <= self.staging.len());
+        if self.staging_used || minimum_size as usize > self.staging.len() {
+            let layout = alloc::Layout::from_size_align(minimum_size as usize * size_of::<u64>(), 8).unwrap();
+            // if this happens in release mode, we can't crash, we have to just handle it anyway
+            unsafe { (alloc::alloc_zeroed(layout), minimum_size) }
+        } else {
+            self.staging_used = true;
+            (self.staging.as_mut_ptr() as *mut u8, self.staging.len() as u32)
+        }
+    }
+
+    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32) {
+        if ptr == self.staging.as_mut_ptr() as *mut u8 {
+            (*std::ptr::slice_from_raw_parts_mut(ptr as *mut u64, words_used as usize)).fill(0);
+            self.staging_used = false;
+        } else {
+            unsafe {
+                alloc::dealloc(
+                    ptr,
+                    alloc::Layout::from_size_align(word_size as usize * size_of::<u64>(), 8).unwrap(),
+                );
+            }
+        }
+    }
 }
 
 impl CapLog {
     pub fn new(
-        max_data_size: u64,
-        header_prefix: &Path,
+        max_file_size: u64,
+        trie_file: &Path,
         data_prefix: &Path,
-        keepalive: u64,
-        sortdelay: u64,
+        max_open_files: usize,
         check_consistency: bool,
-    ) -> Result<CapLog> {
-        let mut log = CapLog {
-            header_prefix: header_prefix.to_path_buf(),
+    ) -> Result<Self> {
+        let trie_storage = if let Some(file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(trie_file)
+            .ok()
+        {
+            HashedArrayStorage::load_file(file)?
+        } else {
+            HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
+        };
+
+        Self::new_storage(
+            max_file_size,
+            trie_storage,
+            data_prefix,
+            max_open_files,
+            check_consistency,
+        )
+    }
+
+    pub fn new_storage(
+        max_file_size: u64,
+        trie_storage: HashedArrayStorage,
+        data_prefix: &Path,
+        max_open_files: usize,
+        check_consistency: bool,
+    ) -> Result<Self> {
+        let storage = Rc::new(RefCell::new(trie_storage));
+        let mut log = Self {
+            max_file_size,
+            trie: HashedArrayTrie::new(&storage, 1),
             data_prefix: data_prefix.to_path_buf(),
-            max_data_size,
-            header_file: None,
             data_file: None,
-            header_count: 0,
-            data_offset: 0,
-            headers: AtomicRingBuffer::new(),
-            data: AtomicRingBuffer::new(),
-            finalizing: AtomicBool::new(false),
-            error_flag: AtomicBool::new(false),
-            pending_count: AtomicU64::new(0),
+            data_position: 0,
+            staging: StagingAlloc {
+                staging: vec![0_u64; MAX_BUFFER_SIZE].into_boxed_slice(),
+                staging_used: false,
+            },
+            flush_error: AtomicBool::new(false),
+            last_flush: 0,
+            current_id: 0,
             archive: FileManagement {
-                keepalive,
-                sortdelay,
+                max_open_files,
                 files: SortedMap::new(),
             },
             options: ReaderOptions {
                 traversal_limit_in_words: None,
                 nesting_limit: 128,
             },
+            pending: VecDeque::new(),
         };
 
-        if let Some(id) = Self::find_latest_file(&log.header_prefix) {
+        if let Some(id) = Self::find_latest_file(&data_prefix) {
             let data_path = Self::assemble_path(data_prefix, id);
-            let header_path = Self::assemble_path(header_prefix, id);
-            let mut headerstartbuf: [u8; HeaderStart::BYTESIZE] = [0; HeaderStart::BYTESIZE];
-            let headerlength = {
-                let mut file = File::open(&header_path)?;
-                file.read_exact(&mut headerstartbuf)?;
-                file.seek(std::io::SeekFrom::End(0))?
-            };
+            if let Some(mut file) = OpenOptions::new().read(true).write(true).open(data_path).ok() {
+                if check_consistency {
+                    // TODO: Go through file and check all the hashes
 
-            let header_start = HeaderStart::new(&headerstartbuf)?;
+                    // We can assume that the data is a struct of some kind
+                    //let value_reader: capnp::dynamic_value::Reader<'_> = payload.into();
+                    //let struct_reader = value_reader.downcast::<dynamic_struct::Reader<'_>>();
+                    //let payload_size = struct_reader.total_size()?;
+                }
 
-            // We try to be conservative here - if the reported block count is less than the calculated block
-            // count, we use the reported count. Otherwise, we use the calculated block count.
-            log.header_count = std::cmp::min(
-                header_start.blocks,
-                (headerlength - HeaderStart::BYTESIZE as u64) / HeaderBlock::BYTESIZE as u64,
-            );
-            log.data_file = Some(OpenOptions::new().append(true).open(data_path)?);
-            log.header_file = Some(OpenOptions::new().append(true).open(header_path)?);
-        } else {
-            log.header_file = Some(Self::init_header_file(header_prefix, 0)?);
-            log.data_file = Some(File::create(Self::assemble_path(data_prefix, 0))?);
+                file.seek(std::io::SeekFrom::End(0))?;
+                log.data_position = file.stream_position()?;
+                log.data_file = Some(RingBufWriter::new(file));
+
+                return Ok(log);
+            }
         }
+
+        log.reset(0);
 
         Ok(log)
     }
-    fn assemble_path(prefix: &Path, id: u64) -> PathBuf {
+
+    fn assemble_path(prefix: &Path, id: u128) -> PathBuf {
         let mut path = prefix.to_path_buf().into_os_string();
         path.push("_");
         path.push(id.to_string());
         return path.into();
     }
-    fn init_header_file(prefix: &Path, id: u64) -> Result<File> {
-        let mut f = File::create(Self::assemble_path(prefix, id))?;
-        f.write_all(&[0; HeaderStart::BYTESIZE])?;
-        return Ok(f);
-    }
 
-    fn find_latest_file(prefix: &Path) -> Option<u64> {
+    fn find_latest_file(prefix: &Path) -> Option<u128> {
         // Go through the directory prefix is in to find the highest valued file with the given prefix
 
         // Convert to a number and return without opening the file
         None
-    }
-    pub fn get_header(&self, id: u64) -> Result<HeaderBlock> {
-        Err(CapLogError::Unknown.into())
-    }
-    pub fn get(
-        &self,
-        id: u64,
-        schema: Option<u64>,
-        integrity_check: bool,
-    ) -> Result<message::Reader<capnp::serialize::OwnedSegments>> {
-        let header = self.get_header(id)?;
-        if let Some(schema_id) = schema {
-            if schema_id != header.schema {
-                return Err(CapLogError::InvalidSchema(schema_id, header.schema).into());
-            }
-        }
-        self.get_message(
-            header.data,
-            header.length,
-            if integrity_check { Some(header.hash) } else { None },
-        )
     }
 
     #[inline]
@@ -296,14 +259,14 @@ impl CapLog {
         file_callback: F2,
     ) -> Result<R>
     where
-        F1: FnOnce(&CapLog, &[u8]) -> Result<R>,
-        F2: FnOnce(&CapLog, BufReader<File>, u64) -> Result<R>,
+        F1: FnOnce(&Self, &[u8]) -> Result<R>,
+        F2: FnOnce(&Self, BufReader<File>, u64) -> Result<R>,
     {
-        if offset > self.data_offset {
+        if offset > self.data_position {
             return Err(CapLogError::OutOfBounds {
                 v: offset,
                 minimum: 0,
-                maximum: self.data_offset,
+                maximum: self.data_position,
             }
             .into());
         }
@@ -355,8 +318,8 @@ impl CapLog {
             offset,
             length,
             hash,
-            |s: &CapLog, slice: &[u8]| Ok(capnp::serialize_packed::read_message(Cursor::new(slice), s.options)?),
-            |s: &CapLog, reader: BufReader<File>, _: u64| Ok(capnp::serialize_packed::read_message(reader, s.options)?),
+            |s: &Self, slice: &[u8]| Ok(capnp::serialize_packed::read_message(Cursor::new(slice), s.options)?),
+            |s: &Self, reader: BufReader<File>, _: u64| Ok(capnp::serialize_packed::read_message(reader, s.options)?),
         )
     }
 
@@ -381,107 +344,152 @@ impl CapLog {
         )
     }
 
-    pub fn reset() {
-        // Set global lock
+    fn reset(&mut self, id: u128) -> Result<()> {
+        // We open a new file handle first so that we can swap it into the ring buffer if necessary
+        let mut headerstartbuf: [u8; size_of::<HeaderStart>()] = [0; size_of::<HeaderStart>()];
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(Self::assemble_path(&self.data_prefix, self.current_id).as_path())?;
 
-        // Finalize old file and open a new one
+        file.write(&mut headerstartbuf)?;
+        file.flush()?;
+        let position = file.stream_position()?;
 
-        // after setting up the new files, dump everything in our buffers into them
+        if let Some(data_file) = self.data_file.as_mut() {
+            if let Ok((mut flusher, state)) = data_file.lock_flusher() {
+                // Dump current buffer
+                flusher.flush_buf::<MAX_BUFFER_SIZE>(state)?;
+                flusher.get_mut().flush()?;
 
-        // Now that our ring buffers are empty, we can reset them
+                //  Write clean header flag
+                flusher.get_ref().seek(std::io::SeekFrom::Start(0))?;
+                HeaderStart {
+                    flags: HeaderFlags::Clean as u64,
+                }
+                .write(flusher.get_mut())?;
+
+                // Finalize old file
+                if let Err(e) = flusher.get_mut().flush() {
+                    self.flush_error.store(true, Ordering::Release);
+                    return Err(e.into());
+                }
+
+                // Move the old file into the archive because there will likely be some stragglers to write
+                flusher.swap_inner::<MAX_BUFFER_SIZE>(state, &mut file)?;
+                self.archive
+                    .files
+                    .insert(self.current_id, Some(RingBufWriter::new(file)));
+
+                self.trie.storage.borrow_mut().flush()?;
+            } else {
+                return Err(CapLogError::Unknown.into());
+            }
+        } else {
+            self.data_file = Some(RingBufWriter::new(file));
+        }
+
+        self.last_flush = 0;
+        self.current_id = id;
+        self.data_position = position;
+
+        Ok(())
     }
-    pub fn append(&mut self, id: u64, machine_id: u64, schema: u64, data: &[u8]) -> Result<()> {
+
+    pub fn check_write_size(&mut self, size: usize) -> Result<bool> {
+        if let Some(data_file) = self.data_file.as_mut() {
+            Ok(data_file.write_position() + size as u64 > self.max_file_size)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn append(
+        &mut self,
+        snowflake: u64,
+        machine: u64,
+        schema: u64,
+        payload: capnp::any_pointer::Reader<'_>,
+        size: usize,
+    ) -> Result<Receiver<bool>> {
         // We do a sanity check here in case the files are empty or the error bit is set.
-        if self.data_file.is_none() || self.header_file.is_none() || self.error_flag.load(Ordering::Relaxed) {
+        if self.flush_error.load(Ordering::Relaxed) {
             return Err(eyre!("Log filesystem is in bad state!"));
         }
 
         // TODO: Check to see if this is an old insert, which requires us to redirect it to an older file
+        let id = ((machine as u128) << 64) | snowflake as u128;
 
-        // First we insert the data into the ring buffer
-        let position = self.data.append(data)?;
-        let mut block: [u8; HeaderBlock::BYTESIZE] = [0; HeaderBlock::BYTESIZE];
+        // Check if we need to update flush status - this MUST be checked before a potential reset or we lose the flush progress!
+        self.process_pending();
 
-        HeaderBlock {
-            id,
-            schema,
-            data: position as u64,
-            length: data.len() as u64,
-            hash: fastmurmur3::hash(data),
-        }
-        .write_bytes(&mut block);
-
-        {
-            // Increment pending so the error handler knows when we have bailed out
-            self.pending_count.fetch_add(1, Ordering::Release);
-
-            let end = position + data.len();
-
-            // Now we wait until our data has been flushed to disk
-            while self.data.read_location() < end {
-                if self.error_flag.load(Ordering::Relaxed) {
-                    self.pending_count.fetch_sub(1, Ordering::Release);
-                    return Err(eyre!("File flush error!"));
-                }
-
-                // TODO: replace with a full async yield, since flushing to disk will almost certainly require yielding.
-                std::hint::spin_loop();
+        // Check if we need to reset to a new file
+        if self.data_file.is_some() {
+            if self.check_write_size(size)? {
+                self.reset(id)?;
             }
-            self.pending_count.fetch_sub(1, Ordering::Release);
         }
 
-        // Then we insert into the header ring buffer. In the extremely rare case this fails, we just bail out and abandon our written data.
-        let end = self.headers.append(&block)? + HeaderBlock::BYTESIZE;
+        if let Some(data_file) = self.data_file.as_mut() {
+            let mut message = message::Builder::new(&mut self.staging);
 
-        self.pending_count.fetch_add(1, Ordering::Release);
+            let mut builder: log_entry::Builder<'_> = message.init_root();
+            builder.set_snowflake_id(snowflake);
+            builder.set_machine_id(machine);
+            builder.set_schema(schema);
+            builder.get_payload().set_as(payload)?;
 
-        // Now we wait until our header block has been flushed to disk
-        while self.headers.read_location() < end {
-            if self.error_flag.load(Ordering::Relaxed) {
-                self.pending_count.fetch_sub(1, Ordering::Release);
-                return Err(eyre!("File flush error!"));
-            }
+            let position = data_file.write_position();
+            capnp::serialize_packed::write_message(&mut *data_file, &message)?;
+            self.trie.insert(id, position)?;
 
-            // TODO: replace with a full async yield, since flushing to disk will almost certainly require yielding.
-            std::hint::spin_loop();
+            // Asyncronously calculate the hash on the packed data stream and write it into our reserved slot
+            //let hash = murmur3_stream(data_file.view(start, end - start)?, end - start, 0)?;
+            let hash = 0_u128;
+            data_file.write(&hash.to_le_bytes())?;
+
+            let (sender, receiver) = sync_channel(1);
+
+            self.pending.push_back((data_file.write_position(), sender));
+            Ok(receiver)
+        } else {
+            Err(CapLogError::FileError.into())
         }
-
-        self.pending_count.fetch_sub(1, Ordering::Release);
-        Ok(())
     }
 
     // Every time this is called, write all data that is ready to be flushed to disk
     pub fn flush(&mut self) -> Result<()> {
-        if let Some(file) = &mut self.data_file {
-            if let Err(e) = self.data.process(|x| Ok(file.write_all(x)?)) {
-                self.error_flag.swap(true, Ordering::Relaxed);
-
-                // Spin until all pending writes have finished failing
-                while self.pending_count.load(Ordering::Relaxed) > 0 {
-                    std::hint::spin_loop();
-                }
-
-                return Err(e);
-            }
-        } else {
-            return Err(eyre!("Invalid data file!"));
+        if let Some(data_file) = self.data_file.as_mut() {
+            data_file.flush()?;
         }
-
-        if let Some(file) = &mut self.header_file {
-            if let Err(e) = self.headers.process(|x| Ok(file.write_all(x)?)) {
-                self.error_flag.swap(true, Ordering::Relaxed);
-
-                // Spin until all pending writes have finished failing
-                while self.pending_count.load(Ordering::Relaxed) > 0 {
-                    std::hint::spin_loop();
-                }
-
-                return Err(e);
-            }
-        } else {
-            return Err(eyre!("Invalid header file!"));
-        }
-
         Ok(())
+    }
+
+    pub fn process_pending(&mut self) {
+        if let Some(data_file) = self.data_file.as_ref() {
+            let cur_flush = data_file.flush_position();
+            if self.last_flush < cur_flush {
+                while !self.pending.is_empty() {
+                    if self.pending.front().unwrap().0 <= cur_flush {
+                        // We only get an error if the receiver has stopped existing, which we don't care about
+                        let _ = self.pending.pop_front().unwrap().1.send(true);
+                    } else {
+                        break;
+                    }
+                }
+
+                self.last_flush = cur_flush;
+            }
+        }
+    }
+}
+
+impl Drop for CapLog {
+    fn drop(&mut self) {
+        self.process_pending();
+        let _ = self.trie.storage.borrow_mut().flush();
+        if let Some(data_file) = self.data_file.as_mut() {
+            let _ = data_file.flush();
+        }
     }
 }

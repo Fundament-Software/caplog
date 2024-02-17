@@ -1,9 +1,9 @@
-mod atomic_ring_buffer;
 mod caplog;
 mod fallthrough;
 mod logsink;
 mod logsource;
 pub mod murmur3;
+mod ring_buf_writer;
 pub mod sorted_map;
 use bitfield_struct::bitfield;
 mod hashed_array_trie;
