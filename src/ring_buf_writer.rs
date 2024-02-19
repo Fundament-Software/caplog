@@ -1,16 +1,17 @@
+use crate::offset_io::{OffsetRead, OffsetWrite};
 use std::cell::UnsafeCell;
 use std::io::{IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LockResult, Mutex, MutexGuard};
 
-pub struct RingBufFlusher<W: ?Sized + Write> {
+pub struct RingBufFlusher<W: ?Sized + OffsetWrite> {
     panicked: bool,
     inner: W,
 }
 
 pub struct RingBufState {
-    buf: UnsafeCell<Box<[u8]>>,
+    staging: UnsafeCell<Box<[u8]>>,
     start: AtomicUsize,
     marker: AtomicUsize,
     flush_head: AtomicU64,
@@ -18,34 +19,34 @@ pub struct RingBufState {
 }
 /// This is a ring-buffered writer with an atomic write marker that allows
 /// one thread to write and one thread to flush to disk.
-pub struct RingBufWriter<W: ?Sized + Write, const POW2_SIZE: usize> {
+pub struct RingBufWriter<W: ?Sized + OffsetWrite, const POW2_SIZE: usize> {
     state: RingBufState,
     flusher: Mutex<RingBufFlusher<W>>,
 }
 
-impl<W: Write + Seek, const POW2_SIZE: usize> RingBufWriter<W, POW2_SIZE> {
+impl<W: OffsetWrite + Seek, const POW2_SIZE: usize> RingBufWriter<W, POW2_SIZE> {
     pub fn new(mut inner: W) -> RingBufWriter<W, POW2_SIZE> {
+        inner.seek(SeekFrom::End(0));
+        let position = inner.stream_position().unwrap();
         RingBufWriter {
             state: RingBufState {
-                buf: UnsafeCell::new(vec![0_u8; POW2_SIZE].into_boxed_slice()),
+                staging: UnsafeCell::new(vec![0_u8; POW2_SIZE].into_boxed_slice()),
                 start: AtomicUsize::new(0),
                 marker: AtomicUsize::new(0),
                 flush_head: AtomicU64::new(0),
-                write_head: AtomicU64::new(inner.stream_position().unwrap()),
+                write_head: AtomicU64::new(position),
             },
-            flusher: Mutex::new(RingBufFlusher { inner, panicked: false }),
+            flusher: Mutex::new(RingBufFlusher { panicked: false, inner }),
         }
     }
 }
 
-impl<W: Write + Seek> RingBufFlusher<W> {
+impl<W: OffsetWrite + Seek> RingBufFlusher<W> {
     pub fn swap_inner<const SIZE: usize>(&mut self, state: &mut RingBufState, other: &mut W) -> Result<()> {
         let position = other.stream_position()?;
         std::mem::swap(&mut self.inner, other);
-        state
-            .write_head
-            .store(state.len::<SIZE>() as u64 + position, Ordering::Release);
         state.flush_head.store(0, Ordering::Release);
+        state.write_head.store(position, Ordering::Release);
         Ok(())
     }
 }
@@ -66,7 +67,7 @@ fn mutex_lock_err() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "Could not acquire mutex!")
 }
 
-impl<W: ?Sized + Write> RingBufFlusher<W> {
+impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
     pub fn get_ref(&self) -> &W {
         &self.inner
     }
@@ -81,15 +82,20 @@ impl<W: ?Sized + Write> RingBufFlusher<W> {
     #[must_use]
     pub fn flush_buf<const SIZE: usize>(&mut self, state: &mut RingBufState) -> Result<()> {
         let mut start = state.start.load(Ordering::Acquire);
+        let mut position = state.write_head.load(Ordering::Acquire);
         let marker = state.marker.load(Ordering::Acquire);
-        let buf = state.buf.get_mut();
+        let staging = state.staging.get_mut();
+
         while start != marker {
             self.panicked = true;
-            let r = self.inner.write(if start > marker {
-                &buf[start..]
-            } else {
-                &buf[start..marker]
-            });
+            let r = self.inner.write_at(
+                if start > marker {
+                    &staging[start..]
+                } else {
+                    &staging[start..marker]
+                },
+                position,
+            );
             self.panicked = false;
 
             match r {
@@ -99,23 +105,28 @@ impl<W: ?Sized + Write> RingBufFlusher<W> {
                         "failed to write the buffered data",
                     ));
                 }
-                Ok(n) => start = (start + n) % SIZE,
+                Ok(n) => {
+                    start = (start + n) % SIZE;
+                    position += n as u64;
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
+
+        state.write_head.store(position, Ordering::Release);
         state.start.store(start, Ordering::Release);
         Ok(())
     }
 }
 
-impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
+impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     pub fn flush_position(&self) -> u64 {
         self.state.flush_head.load(Ordering::Relaxed)
     }
 
     pub fn write_position(&self) -> u64 {
-        self.state.write_head.load(Ordering::Relaxed)
+        self.state.write_head.load(Ordering::Relaxed) + self.state.len::<SIZE>() as u64
     }
 
     // Ensure this function does not get inlined into `write`, so that it
@@ -137,10 +148,14 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
         // Why not len > capacity? To avoid a needless trip through the buffer when the input
         // exactly fills it. We'd just need to flush it to the underlying writer anyway.
         if buf.len() >= SIZE {
-            if let Ok(mut flusher) = self.flusher.lock() {
+            if let Ok((mut flusher, state)) = self.lock_flusher() {
+                let position = state.write_head.load(Ordering::Acquire);
                 flusher.panicked = true;
-                let r = flusher.get_mut().write(buf);
+                let r = flusher.get_mut().write_at(buf, position);
                 flusher.panicked = false;
+                if let Ok(n) = r {
+                    state.write_head.store(position + n as u64, Ordering::Release);
+                }
                 r
             } else {
                 Err(mutex_lock_err())
@@ -171,11 +186,6 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
     #[cold]
     #[inline(never)]
     fn write_all_cold(&mut self, buf: &[u8]) -> Result<()> {
-        // Normally, `write_all` just calls `write` in a loop. We can do better
-        // by calling `self.get_mut().write_all()` directly, which avoids
-        // round trips through the buffer in the event of a series of partial
-        // writes in some circumstances.
-
         if buf.len() > self.spare_capacity() {
             if let Ok((mut flusher, state)) = self.lock_flusher() {
                 flusher.flush_buf::<SIZE>(state)?;
@@ -187,10 +197,14 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
         // Why not len > capacity? To avoid a needless trip through the buffer when the input
         // exactly fills it. We'd just need to flush it to the underlying writer anyway.
         if buf.len() >= SIZE {
-            if let Ok(mut flusher) = self.flusher.lock() {
+            if let Ok((mut flusher, state)) = self.lock_flusher() {
+                let position = state.write_head.load(Ordering::Acquire);
                 flusher.panicked = true;
-                let r = flusher.get_mut().write_all(buf);
+                let r = flusher.get_mut().write_all_at(buf, position);
                 flusher.panicked = false;
+                if let Ok(_) = r {
+                    state.write_head.store(position + buf.len() as u64, Ordering::Release);
+                }
                 r
             } else {
                 Err(mutex_lock_err())
@@ -217,23 +231,6 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
     fn spare_capacity(&self) -> usize {
         SIZE - self.state.len::<SIZE>()
     }
-    /*
-    #[inline]
-    fn check_reserved_range(&self, start: usize, length: usize) -> bool {
-        let marker = self.marker.load(Ordering::Acquire);
-
-        if self.end > marker {
-            !(start < marker || start >= self.end || start + length > self.end)
-        } else {
-            let end = start + length;
-            let end_bounded = end % SIZE;
-
-            !(start < marker && start >= self.end)
-                || (end_bounded < marker && end_bounded > self.end)
-                || (start < self.end && end > self.end)
-                || (start >= marker && end_bounded > self.end)
-        }
-    }*/
 
     /// Buffer some data without flushing it, regardless of the size of the
     /// data. Writes as much as possible without exceeding capacity. Returns
@@ -260,10 +257,10 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
         let end = start + src.len();
 
         if end <= SIZE {
-            self.state.buf.get_mut()[start..end].copy_from_slice(src);
+            self.state.staging.get_mut()[start..end].copy_from_slice(src);
         } else {
-            self.state.buf.get_mut()[start..].copy_from_slice(&src[..(SIZE - start)]);
-            self.state.buf.get_mut()[..(end % SIZE)].copy_from_slice(&src[(SIZE - start)..]);
+            self.state.staging.get_mut()[start..].copy_from_slice(&src[..(SIZE - start)]);
+            self.state.staging.get_mut()[..(end % SIZE)].copy_from_slice(&src[(SIZE - start)..]);
         }
 
         self.state.marker.store(end, Ordering::Release);
@@ -279,7 +276,7 @@ impl<W: ?Sized + Write, const SIZE: usize> RingBufWriter<W, SIZE> {
     }
 }
 
-impl<W: ?Sized + Write + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZE> {
+impl<W: ?Sized + OffsetWrite + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZE> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         // Use < instead of <= to avoid a needless trip through the buffer in some cases.
@@ -294,10 +291,6 @@ impl<W: ?Sized + Write + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZ
         } else {
             self.write_cold(buf)
         }
-        .map(|x| {
-            self.state.write_head.fetch_add(x as u64, Ordering::AcqRel);
-            x
-        })
     }
 
     #[inline]
@@ -314,16 +307,13 @@ impl<W: ?Sized + Write + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZ
         } else {
             self.write_all_cold(buf)
         }
-        .map(|_| {
-            self.state.write_head.fetch_add(buf.len() as u64, Ordering::AcqRel);
-        })
     }
 
     fn flush(&mut self) -> Result<()> {
         if let Ok((mut flusher, state)) = self.lock_flusher() {
             flusher.flush_buf::<SIZE>(state)?;
             let position = flusher.inner.stream_position()?;
-            flusher.get_mut().flush()?;
+            flusher.get_mut().flush_all()?;
             state.flush_head.store(position, Ordering::Release);
             Ok(())
         } else {
@@ -332,7 +322,7 @@ impl<W: ?Sized + Write + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZ
     }
 }
 
-impl<W: ?Sized + Write, const SIZE: usize> std::fmt::Debug for RingBufWriter<W, SIZE>
+impl<W: ?Sized + OffsetWrite, const SIZE: usize> std::fmt::Debug for RingBufWriter<W, SIZE>
 where
     W: std::fmt::Debug,
 {
@@ -343,33 +333,7 @@ where
     }
 }
 
-impl<W: ?Sized + Write + Seek, const SIZE: usize> Seek for RingBufWriter<W, SIZE> {
-    /// Seek to the offset, in bytes, in the underlying writer.
-    ///
-    /// Seeking always writes out the internal buffer before seeking.
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        if let Ok((mut flusher, state)) = self.lock_flusher() {
-            flusher.flush_buf::<SIZE>(state)?;
-            let result = flusher.get_mut().seek(pos)?;
-            state
-                .write_head
-                .store(state.len::<SIZE>() as u64 + result, Ordering::Release);
-            Ok(result)
-        } else {
-            Err(mutex_lock_err())
-        }
-    }
-
-    fn stream_position(&mut self) -> Result<u64> {
-        if let Ok(mut flusher) = self.flusher.lock() {
-            flusher.inner.stream_position()
-        } else {
-            Err(mutex_lock_err())
-        }
-    }
-}
-
-impl<W: ?Sized + Write, const SIZE: usize> Drop for RingBufWriter<W, SIZE> {
+impl<W: ?Sized + OffsetWrite, const SIZE: usize> Drop for RingBufWriter<W, SIZE> {
     fn drop(&mut self) {
         if let Ok((mut flusher, state)) = self.lock_flusher() {
             if !flusher.panicked {
