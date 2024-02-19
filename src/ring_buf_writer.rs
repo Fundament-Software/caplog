@@ -1,4 +1,5 @@
 use crate::offset_io::{OffsetRead, OffsetWrite};
+use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::io::{IoSlice, Read, Result, Seek, SeekFrom, Write};
 use std::ops::Deref;
@@ -17,6 +18,9 @@ pub struct RingBufState {
     flush_head: AtomicU64,
     write_head: AtomicU64,
 }
+
+unsafe impl Sync for RingBufState {}
+
 /// This is a ring-buffered writer with an atomic write marker that allows
 /// one thread to write and one thread to flush to disk.
 pub struct RingBufWriter<W: ?Sized + OffsetWrite, const POW2_SIZE: usize> {
@@ -26,7 +30,6 @@ pub struct RingBufWriter<W: ?Sized + OffsetWrite, const POW2_SIZE: usize> {
 
 impl<W: OffsetWrite + Seek, const POW2_SIZE: usize> RingBufWriter<W, POW2_SIZE> {
     pub fn new(mut inner: W) -> RingBufWriter<W, POW2_SIZE> {
-        inner.seek(SeekFrom::End(0));
         let position = inner.stream_position().unwrap();
         RingBufWriter {
             state: RingBufState {
@@ -42,7 +45,7 @@ impl<W: OffsetWrite + Seek, const POW2_SIZE: usize> RingBufWriter<W, POW2_SIZE> 
 }
 
 impl<W: OffsetWrite + Seek> RingBufFlusher<W> {
-    pub fn swap_inner<const SIZE: usize>(&mut self, state: &mut RingBufState, other: &mut W) -> Result<()> {
+    pub fn swap_inner<const SIZE: usize>(&mut self, state: &RingBufState, other: &mut W) -> Result<()> {
         let position = other.stream_position()?;
         std::mem::swap(&mut self.inner, other);
         state.flush_head.store(0, Ordering::Release);
@@ -80,11 +83,11 @@ impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
     /// hasn't been committed to, because we allow writers to manipulate data they've
     /// written but not committed.
     #[must_use]
-    pub fn flush_buf<const SIZE: usize>(&mut self, state: &mut RingBufState) -> Result<()> {
+    pub fn flush_buf<const SIZE: usize>(&mut self, state: &RingBufState) -> Result<()> {
         let mut start = state.start.load(Ordering::Acquire);
         let mut position = state.write_head.load(Ordering::Acquire);
         let marker = state.marker.load(Ordering::Acquire);
-        let staging = state.staging.get_mut();
+        let staging = unsafe { &*state.staging.get() };
 
         while start != marker {
             self.panicked = true;
@@ -136,7 +139,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     // or their write patterns are somewhat pathological.
     #[cold]
     #[inline(never)]
-    fn write_cold(&mut self, buf: &[u8]) -> Result<usize> {
+    fn write_cold(&self, buf: &[u8]) -> Result<usize> {
         if buf.len() > self.spare_capacity() {
             if let Ok((mut flusher, state)) = self.lock_flusher() {
                 flusher.flush_buf::<SIZE>(state)?;
@@ -185,7 +188,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     // or their write patterns are somewhat pathological.
     #[cold]
     #[inline(never)]
-    fn write_all_cold(&mut self, buf: &[u8]) -> Result<()> {
+    fn write_all_cold(&self, buf: &[u8]) -> Result<()> {
         if buf.len() > self.spare_capacity() {
             if let Ok((mut flusher, state)) = self.lock_flusher() {
                 flusher.flush_buf::<SIZE>(state)?;
@@ -235,7 +238,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     /// Buffer some data without flushing it, regardless of the size of the
     /// data. Writes as much as possible without exceeding capacity. Returns
     /// the number of bytes written.
-    pub(super) fn write_to_buf(&mut self, buf: &[u8]) -> usize {
+    pub(super) fn write_to_buf(&self, buf: &[u8]) -> usize {
         let available = self.spare_capacity();
         let amt_to_buffer = available.min(buf.len());
 
@@ -250,33 +253,52 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     // SAFETY: Requires `buf.len() <= self.buf.capacity() - self.buf.len()`,
     // i.e., that input buffer length is less than or equal to spare capacity.
     #[inline]
-    unsafe fn write_to_buffer_unchecked(&mut self, src: &[u8]) {
+    unsafe fn write_to_buffer_unchecked(&self, src: &[u8]) {
         debug_assert!(src.len() < self.spare_capacity());
 
         let start = self.state.marker.load(Ordering::Acquire);
         let end = start + src.len();
 
+        // SAFETY: This operation is safe provided that we are accurately keeping track
+        // of which sections of the buffer are being written to vs. being flushed.
+        let staging = &mut *self.state.staging.get();
+
         if end <= SIZE {
-            self.state.staging.get_mut()[start..end].copy_from_slice(src);
+            staging[start..end].copy_from_slice(src);
         } else {
-            self.state.staging.get_mut()[start..].copy_from_slice(&src[..(SIZE - start)]);
-            self.state.staging.get_mut()[..(end % SIZE)].copy_from_slice(&src[(SIZE - start)..]);
+            staging[start..].copy_from_slice(&src[..(SIZE - start)]);
+            staging[..(end % SIZE)].copy_from_slice(&src[(SIZE - start)..]);
         }
 
         self.state.marker.store(end, Ordering::Release);
     }
 
     pub fn lock_flusher(
-        &mut self,
+        &self,
     ) -> std::result::Result<
-        (MutexGuard<'_, RingBufFlusher<W>>, &mut RingBufState),
+        (MutexGuard<'_, RingBufFlusher<W>>, &RingBufState),
         std::sync::PoisonError<MutexGuard<'_, RingBufFlusher<W>>>,
     > {
-        self.flusher.lock().map(|x| (x, &mut self.state))
+        self.flusher.lock().map(|x| (x, &self.state))
+    }
+
+    /// The Write trait requires flush to take &mut self, but the entire point of our atomic variables here
+    /// is to ensure that we can safely share our RingBufWriter between threads, so this is our real flush
+    /// function
+    pub fn flush_atomic(&self) -> Result<()> {
+        if let Ok((mut flusher, state)) = self.lock_flusher() {
+            flusher.flush_buf::<SIZE>(state)?;
+            let position = state.write_head.load(Ordering::Acquire);
+            flusher.get_mut().flush_all()?;
+            state.flush_head.store(position, Ordering::Release);
+            Ok(())
+        } else {
+            Err(mutex_lock_err())
+        }
     }
 }
 
-impl<W: ?Sized + OffsetWrite + Seek, const SIZE: usize> Write for RingBufWriter<W, SIZE> {
+impl<W: ?Sized + OffsetWrite, const SIZE: usize> Write for RingBufWriter<W, SIZE> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         // Use < instead of <= to avoid a needless trip through the buffer in some cases.
@@ -310,15 +332,7 @@ impl<W: ?Sized + OffsetWrite + Seek, const SIZE: usize> Write for RingBufWriter<
     }
 
     fn flush(&mut self) -> Result<()> {
-        if let Ok((mut flusher, state)) = self.lock_flusher() {
-            flusher.flush_buf::<SIZE>(state)?;
-            let position = flusher.inner.stream_position()?;
-            flusher.get_mut().flush_all()?;
-            state.flush_head.store(position, Ordering::Release);
-            Ok(())
-        } else {
-            Err(mutex_lock_err())
-        }
+        self.flush_atomic()
     }
 }
 
