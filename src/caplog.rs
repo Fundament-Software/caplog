@@ -1,10 +1,11 @@
 use crate::log_capnp::{log_entry, log_sink};
+use crate::offset_io::{OffsetRead, OffsetWrite, ReadSessionBuf};
 use crate::ring_buf_writer::RingBufWriter;
 
 use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie};
 use super::murmur3::murmur3_stream;
 use super::sorted_map::SortedMap;
-use capnp::message::ReaderOptions;
+use capnp::message::{ReaderOptions, TypedReader};
 use capnp::{data, message};
 use eyre::eyre;
 use eyre::Result;
@@ -12,13 +13,13 @@ use std::alloc;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::BufReader;
 use std::io::{Cursor, Seek, Write};
 use std::mem::size_of;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use thiserror::Error;
 
@@ -26,10 +27,10 @@ use thiserror::Error;
 pub enum CapLogError {
     #[error("value {v:?} is out of bounds: [{minimum:?}-{maximum:?}]")]
     OutOfBounds { v: u64, minimum: u64, maximum: u64 },
-    #[error("Length of data {0} exceeds data stream length by {1}")]
-    InvalidBlock(u64, u64),
     #[error("Expected schema hash {0} but found {1}")]
     InvalidSchema(u64, u64),
+    #[error("Data ID {0} doesn't match Trie ID {1}")]
+    Mismatch(u128, u128),
     #[error("Data failed integrity check (got {0} but expected {1})")]
     CorruptData(u128, u128),
     #[error("the data for key `{0}` is not available")]
@@ -38,6 +39,8 @@ pub enum CapLogError {
     NotEnoughBuffer(usize, usize),
     #[error("File I/O error encountered or filesystem in bad state")]
     FileError,
+    #[error("File was not closed properly")]
+    DirtyFile,
     #[error("unknown caplog error")]
     Unknown,
 }
@@ -70,11 +73,11 @@ impl HeaderStart {
     }
 
     #[inline]
-    pub fn write<T>(&self, target: &mut T) -> Result<()>
+    pub fn write_at<T>(&self, target: &mut T, offset: u64) -> Result<()>
     where
-        T: std::io::Write,
+        T: OffsetWrite,
     {
-        target.write_all(&u64::to_le_bytes(self.flags))?;
+        target.write_all_at(&u64::to_le_bytes(self.flags), offset)?;
         Ok(())
     }
 }
@@ -86,16 +89,52 @@ const MAX_BUFFER_SIZE: usize = 2_usize.pow(22);
 const MAX_HEADER_SIZE: usize = MAX_BUFFER_SIZE / 32;
 const MAX_OPEN_FILES: usize = 10;
 
-#[derive(Debug)]
 struct FileManagement {
     max_open_files: usize,
-    files: SortedMap<u128, Option<RingBufWriter<File, 4096>>>,
+    files: SortedMap<u128, Option<File>>,
+    prefix: PathBuf,
 }
 
 impl FileManagement {
-    pub fn get_data_file(&self, offset: u64) -> Result<(BufReader<File>, usize)> {
-        // BufReader::new(file);
-        Err(CapLogError::Unknown.into())
+    pub fn get_data_file(&mut self, id: u128) -> Option<&File> {
+        let e = self.files.range(..=id).last()?;
+        if let Some(_) = e.1.as_ref() {
+            self.files.get(&e.0)?.as_ref()
+        } else {
+            let k = e.0;
+            let p = self.get_path(id);
+            let v = self.files.get_mut(&k)?;
+            *v = OpenOptions::new().read(true).write(true).open(p).ok();
+            (*v).as_ref()
+        }
+    }
+
+    pub fn get_path(&self, id: u128) -> PathBuf {
+        let mut path = self.prefix.to_path_buf().into_os_string();
+        path.push("_");
+        path.push(id.to_string());
+        return path.into();
+    }
+
+    pub fn new_file(&self, id: u128) -> Result<File> {
+        let header = HeaderStart { flags: 0 };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(self.get_path(id).as_path())?;
+
+        file.try_clone();
+        header.write_at(&mut file, 0);
+        file.flush()?;
+        Ok(file)
+    }
+
+    pub fn find_latest_file(&self) -> Option<u128> {
+        // Go through the directory prefix is in to find the highest valued file with the given prefix
+
+        // Convert to a number and return without opening the file
+        None
     }
 }
 
@@ -110,8 +149,7 @@ pub struct CapLog {
     trie: HashedArrayTrie<u128>,
     //schemas: HashMap<u64, Vec<u8>>,
     staging: StagingAlloc,
-    data_prefix: PathBuf,
-    data_file: Option<RingBufWriter<File, MAX_BUFFER_SIZE>>,
+    data_file: RingBufWriter<File, MAX_BUFFER_SIZE>,
     data_position: u64,
     flush_error: AtomicBool, // This is set if there is a failure writing data to disk, which forces all pending writes to return errors
     last_flush: u64,
@@ -186,33 +224,22 @@ impl CapLog {
         check_consistency: bool,
     ) -> Result<Self> {
         let storage = Rc::new(RefCell::new(trie_storage));
-        let mut log = Self {
-            max_file_size,
-            trie: HashedArrayTrie::new(&storage, 1),
-            data_prefix: data_prefix.to_path_buf(),
-            data_file: None,
-            data_position: 0,
-            staging: StagingAlloc {
-                staging: vec![0_u64; MAX_BUFFER_SIZE].into_boxed_slice(),
-                staging_used: false,
-            },
-            flush_error: AtomicBool::new(false),
-            last_flush: 0,
-            current_id: 0,
-            archive: FileManagement {
-                max_open_files,
-                files: SortedMap::new(),
-            },
-            options: ReaderOptions {
-                traversal_limit_in_words: None,
-                nesting_limit: 128,
-            },
-            pending: VecDeque::new(),
+        let archive = FileManagement {
+            prefix: data_prefix.to_path_buf(),
+            max_open_files,
+            files: SortedMap::new(),
         };
 
-        if let Some(id) = Self::find_latest_file(&data_prefix) {
-            let data_path = Self::assemble_path(data_prefix, id);
+        let (mut file, id) = if let Some(id) = archive.find_latest_file() {
+            let data_path = archive.get_path(id);
             if let Some(mut file) = OpenOptions::new().read(true).write(true).open(data_path).ok() {
+                // Always check for the clean close flag, if that's not set a recovery pass should be done
+                let mut headerstartbuf = [0_u8; size_of::<HeaderStart>()];
+                file.read_at(&mut headerstartbuf, 0);
+                if (HeaderStart::new(&headerstartbuf)?.flags & HeaderFlags::Clean as u64) == 0 {
+                    return Err(CapLogError::DirtyFile.into());
+                }
+
                 if check_consistency {
                     // TODO: Go through file and check all the hashes
 
@@ -223,170 +250,110 @@ impl CapLog {
                 }
 
                 file.seek(std::io::SeekFrom::End(0))?;
-                log.data_position = file.stream_position()?;
-                log.data_file = Some(RingBufWriter::new(file));
 
-                return Ok(log);
+                (file, id)
+            } else {
+                return Err(CapLogError::FileError.into());
             }
-        }
+        } else {
+            (archive.new_file(0)?, 0)
+        };
 
-        log.reset(0);
+        let file_clone = file.try_clone()?;
 
+        let mut log = Self {
+            max_file_size,
+            trie: HashedArrayTrie::new(&storage, 1),
+            data_position: file.stream_position()?,
+            data_file: RingBufWriter::new(file),
+            staging: StagingAlloc {
+                staging: vec![0_u64; MAX_BUFFER_SIZE].into_boxed_slice(),
+                staging_used: false,
+            },
+            flush_error: AtomicBool::new(false),
+            last_flush: 0,
+            current_id: id,
+            archive,
+            options: ReaderOptions {
+                traversal_limit_in_words: None,
+                nesting_limit: 128,
+            },
+            pending: VecDeque::new(),
+        };
+
+        log.archive.files.insert(id, Some(file_clone));
         Ok(log)
     }
 
-    fn assemble_path(prefix: &Path, id: u128) -> PathBuf {
-        let mut path = prefix.to_path_buf().into_os_string();
-        path.push("_");
-        path.push(id.to_string());
-        return path.into();
-    }
-
-    fn find_latest_file(prefix: &Path) -> Option<u128> {
-        // Go through the directory prefix is in to find the highest valued file with the given prefix
-
-        // Convert to a number and return without opening the file
-        None
+    #[inline]
+    pub fn get_log(
+        &mut self,
+        snowflake: u64,
+        machine: u64,
+        check_consistency: bool,
+        builder: &mut capnp::any_pointer::Builder<'_>,
+    ) -> Result<()> {
+        let id = ((machine as u128) << 64) | snowflake as u128;
+        self.get_internal(id, self.trie.get(id)?, check_consistency, builder)
     }
 
     #[inline]
-    fn get_internal<R, F1, F2>(
-        &self,
+    fn get_internal(
+        &mut self,
+        id: u128,
         offset: u64,
-        length: u64,
-        hash: Option<u128>,
-        callback: F1,
-        file_callback: F2,
-    ) -> Result<R>
-    where
-        F1: FnOnce(&Self, &[u8]) -> Result<R>,
-        F2: FnOnce(&Self, BufReader<File>, u64) -> Result<R>,
-    {
-        if offset > self.data_position {
-            return Err(CapLogError::OutOfBounds {
-                v: offset,
-                minimum: 0,
-                maximum: self.data_position,
-            }
-            .into());
-        }
-
-        // Are we querying our current in-progress file that's still in memory?
-        /*if offset >= self.base_data_offset {
-            let data_offset: usize = (offset - self.base_data_offset) as usize;
-            let slice = &self.data[data_offset..(data_offset + length as usize)];
-
-            // If we requested an integrity check, hash the data and compare with the expected value
-            if let Some(expected) = hash {
-                let result = fastmurmur3::hash(slice);
-                if expected != result {
-                    return Err(CapLogError::CorruptData(result, expected).into());
-                }
-            }
-
-            return Ok(callback(&self, slice)?);
-        }*/
-
+        check_consistency: bool,
+        builder: &mut capnp::any_pointer::Builder<'_>,
+    ) -> Result<()> {
         // Okay, try to find the file
-        let (mut reader, data_offset) = self.archive.get_data_file(offset)?;
+        let f = self.archive.get_data_file(id).ok_or(CapLogError::FileError)?;
 
-        // Seek to the message location
-        reader.seek_relative(data_offset as i64)?;
+        let session: ReadSessionBuf<'_, File, 4096> = ReadSessionBuf::new(&f, offset);
 
-        // If we requested an integrity check, hash the data (using a slightly different codepath for
-        // files) and compare it with the expected value
-        if let Some(expected) = hash {
-            let result = murmur3_stream(&mut reader, length as usize, 0)?;
-            if expected != result {
-                return Err(CapLogError::CorruptData(result, expected).into());
-            }
-            // Reset reader by the negative length
-            reader.seek_relative(-(length as i64))?;
+        let reader = capnp::serialize_packed::read_message(session, self.options)?;
+        let message = TypedReader::<_, log_entry::Owned>::new(reader);
+        let entry = message.get()?;
+        let entry_id = ((entry.get_machine_id() as u128) << 64) | entry.get_snowflake_id() as u128;
+        if entry_id != id {
+            return Err(CapLogError::Mismatch(entry_id, id).into());
         }
 
-        return Ok(file_callback(&self, reader, length)?);
-    }
+        if check_consistency {
+            // TODO
+        }
 
-    #[inline]
-    pub fn get_message(
-        &self,
-        offset: u64,
-        length: u64,
-        hash: Option<u128>,
-    ) -> Result<message::Reader<capnp::serialize::OwnedSegments>> {
-        self.get_internal(
-            offset,
-            length,
-            hash,
-            |s: &Self, slice: &[u8]| Ok(capnp::serialize_packed::read_message(Cursor::new(slice), s.options)?),
-            |s: &Self, reader: BufReader<File>, _: u64| Ok(capnp::serialize_packed::read_message(reader, s.options)?),
-        )
-    }
-
-    pub fn get_packed<F1, F2>(
-        &self,
-        offset: u64,
-        length: u64,
-        callback: F1,
-        file_callback: F2,
-        hash: Option<u128>,
-    ) -> Result<()>
-    where
-        F1: FnOnce(&[u8]) -> Result<()>,
-        F2: FnOnce(BufReader<File>, u64) -> Result<()>,
-    {
-        self.get_internal(
-            offset,
-            length,
-            hash,
-            |s: &CapLog, slice: &[u8]| Ok(callback(slice)?),
-            |s: &CapLog, reader: BufReader<File>, len: u64| Ok(file_callback(reader, len)?),
-        )
+        builder.set_as(entry.get_payload())?;
+        Ok(())
     }
 
     fn reset(&mut self, id: u128) -> Result<()> {
         // We open a new file handle first so that we can swap it into the ring buffer if necessary
-        let mut headerstartbuf: [u8; size_of::<HeaderStart>()] = [0; size_of::<HeaderStart>()];
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(Self::assemble_path(&self.data_prefix, self.current_id).as_path())?;
-
-        file.write(&mut headerstartbuf)?;
-        file.flush()?;
+        let mut file = self.archive.new_file(self.current_id)?;
         let position = file.stream_position()?;
 
-        if let Some(data_file) = self.data_file.as_mut() {
-            if let Ok((mut flusher, state)) = data_file.lock_flusher() {
-                // Dump current buffer
-                flusher.flush_buf::<MAX_BUFFER_SIZE>(state)?;
-                flusher.get_mut().flush()?;
+        if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
+            // Dump current buffer
+            flusher.flush_buf::<MAX_BUFFER_SIZE>(state)?;
+            flusher.get_mut().flush()?;
 
-                //  Write clean header flag
-                flusher.get_ref().seek(std::io::SeekFrom::Start(0))?;
-                HeaderStart {
-                    flags: HeaderFlags::Clean as u64,
-                }
-                .write(flusher.get_mut())?;
-
-                // Finalize old file
-                if let Err(e) = flusher.get_mut().flush() {
-                    self.flush_error.store(true, Ordering::Release);
-                    return Err(e.into());
-                }
-
-                // Move the old file into the archive because there will likely be some stragglers to write
-                flusher.swap_inner::<MAX_BUFFER_SIZE>(state, &mut file)?;
-                self.archive
-                    .files
-                    .insert(self.current_id, Some(RingBufWriter::new(file)));
-
-                self.trie.storage.borrow_mut().flush()?;
-            } else {
-                return Err(CapLogError::Unknown.into());
+            //  Write clean header flag
+            HeaderStart {
+                flags: HeaderFlags::Clean as u64,
             }
+            .write_at(flusher.get_mut(), 0)?;
+
+            // Finalize old file
+            if let Err(e) = flusher.get_mut().flush() {
+                self.flush_error.store(true, Ordering::Release);
+                return Err(e.into());
+            }
+
+            // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
+            flusher.swap_inner::<MAX_BUFFER_SIZE>(state, &mut file)?;
+
+            self.trie.storage.borrow_mut().flush()?;
         } else {
-            self.data_file = Some(RingBufWriter::new(file));
+            return Err(CapLogError::Unknown.into());
         }
 
         self.last_flush = 0;
@@ -396,12 +363,8 @@ impl CapLog {
         Ok(())
     }
 
-    pub fn check_write_size(&mut self, size: usize) -> Result<bool> {
-        if let Some(data_file) = self.data_file.as_mut() {
-            Ok(data_file.write_position() + size as u64 > self.max_file_size)
-        } else {
-            Ok(false)
-        }
+    pub fn check_write_size(&mut self, size: usize) -> bool {
+        self.data_file.write_position() + size as u64 > self.max_file_size
     }
 
     pub fn append(
@@ -424,62 +387,51 @@ impl CapLog {
         self.process_pending();
 
         // Check if we need to reset to a new file
-        if self.data_file.is_some() {
-            if self.check_write_size(size)? {
-                self.reset(id)?;
-            }
+        if self.check_write_size(size) {
+            self.reset(id)?;
         }
 
-        if let Some(data_file) = self.data_file.as_mut() {
-            let mut message = message::Builder::new(&mut self.staging);
+        let mut message = message::Builder::new(&mut self.staging);
 
-            let mut builder: log_entry::Builder<'_> = message.init_root();
-            builder.set_snowflake_id(snowflake);
-            builder.set_machine_id(machine);
-            builder.set_schema(schema);
-            builder.get_payload().set_as(payload)?;
+        let mut builder: log_entry::Builder<'_> = message.init_root();
+        builder.set_snowflake_id(snowflake);
+        builder.set_machine_id(machine);
+        builder.set_schema(schema);
+        builder.get_payload().set_as(payload)?;
 
-            let position = data_file.write_position();
-            capnp::serialize_packed::write_message(&mut *data_file, &message)?;
-            self.trie.insert(id, position)?;
+        let position = self.data_file.write_position();
+        capnp::serialize_packed::write_message(&mut self.data_file, &message)?;
+        self.trie.insert(id, position)?;
 
-            // Asyncronously calculate the hash on the packed data stream and write it into our reserved slot
-            //let hash = murmur3_stream(data_file.view(start, end - start)?, end - start, 0)?;
-            let hash = 0_u128;
-            data_file.write(&hash.to_le_bytes())?;
+        // Asyncronously calculate the hash on the packed data stream and write it into our reserved slot
+        //let hash = murmur3_stream(data_file.view(start, end - start)?, end - start, 0)?;
+        let hash = 0_u128;
+        self.data_file.write(&hash.to_le_bytes())?;
 
-            let (sender, receiver) = sync_channel(1);
+        let (sender, receiver) = sync_channel(1);
 
-            self.pending.push_back((data_file.write_position(), sender));
-            Ok(receiver)
-        } else {
-            Err(CapLogError::FileError.into())
-        }
+        self.pending.push_back((self.data_file.write_position(), sender));
+        Ok(receiver)
     }
 
     // Every time this is called, write all data that is ready to be flushed to disk
     pub fn flush(&mut self) -> Result<()> {
-        if let Some(data_file) = self.data_file.as_mut() {
-            data_file.flush()?;
-        }
-        Ok(())
+        Ok(self.data_file.flush()?)
     }
 
     pub fn process_pending(&mut self) {
-        if let Some(data_file) = self.data_file.as_ref() {
-            let cur_flush = data_file.flush_position();
-            if self.last_flush < cur_flush {
-                while !self.pending.is_empty() {
-                    if self.pending.front().unwrap().0 <= cur_flush {
-                        // We only get an error if the receiver has stopped existing, which we don't care about
-                        let _ = self.pending.pop_front().unwrap().1.send(true);
-                    } else {
-                        break;
-                    }
+        let cur_flush = self.data_file.flush_position();
+        if self.last_flush < cur_flush {
+            while !self.pending.is_empty() {
+                if self.pending.front().unwrap().0 <= cur_flush {
+                    // We only get an error if the receiver has stopped existing, which we don't care about
+                    let _ = self.pending.pop_front().unwrap().1.send(true);
+                } else {
+                    break;
                 }
-
-                self.last_flush = cur_flush;
             }
+
+            self.last_flush = cur_flush;
         }
     }
 }
@@ -488,8 +440,6 @@ impl Drop for CapLog {
     fn drop(&mut self) {
         self.process_pending();
         let _ = self.trie.storage.borrow_mut().flush();
-        if let Some(data_file) = self.data_file.as_mut() {
-            let _ = data_file.flush();
-        }
+        let _ = self.data_file.flush();
     }
 }

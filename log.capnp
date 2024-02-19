@@ -5,7 +5,7 @@ interface LogSink {
 }
 
 interface LogSource {
-  get @0 (snowflakeId :UInt64, machineId :UInt64, schema :UInt64, verify :Bool) -> (payload :Data);
+  get @0 (snowflakeId :UInt64, machineId :UInt64, schema :UInt64, verify :Bool) -> (payload :AnyPointer);
 }
 
 struct LogEntry {

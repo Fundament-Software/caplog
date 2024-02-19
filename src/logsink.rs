@@ -1,8 +1,11 @@
+use crate::log_capnp::log_source::Server;
+
 use super::caplog::CapLog;
 use super::log_capnp::{log_entry, log_sink};
 use capnp::capability::Promise;
 use capnp_macros::{capnp_build, capnproto_rpc};
 use core::future::Future;
+use std::future::Pending;
 use std::pin::Pin;
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
@@ -15,7 +18,6 @@ impl Future for LogFuture {
     type Output = core::result::Result<(), ::capnp::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        return Poll::Ready(Ok(()));
         match self.receiver.try_recv() {
             Ok(_) => Poll::Ready(Ok(())),
             Err(_) => Poll::Pending,
@@ -63,28 +65,35 @@ async fn test_basic_log() -> Result<()> {
         // log request
         let mut request = client.log_request();
         {
-            request.get().set_machine_id(1);
-            request.get().set_snowflake_id(2);
+            request.get().set_snowflake_id(1);
+            request.get().set_machine_id(2);
             request.get().set_schema(0);
             let payload = request.get().init_payload();
             let mut builder = payload.init_as::<log_entry::Builder>();
-            builder.set_machine_id(4);
-            builder.set_snowflake_id(5);
+            builder.set_snowflake_id(4);
+            builder.set_machine_id(5);
             builder.set_schema(6);
         }
-        let result = request.send().promise.await?;
+        let mut result = request.send().promise;
+        if let Poll::Ready(_) = futures::poll!(&mut result) {
+            assert!(false, "Promise shouldn't be ready yet!");
+        }
         let hook = set.get_local_server(&client).await.unwrap();
         let mut logger = hook.borrow_mut();
-        logger.flush();
+        logger.flush()?;
         logger.process_pending();
-    }
+        result.await?;
 
-    let mut output = Vec::new();
-    OpenOptions::new()
-        .read(true)
-        .open(data_prefix.join("_0"))?
-        .read_to_end(&mut output)?;
-    println!("OUTPUT: {:?}", output);
+        let mut message = capnp::message::Builder::new_default();
+        let mut root = message.init_root();
+
+        logger.get_log(1, 2, false, &mut root)?;
+
+        let entry = root.into_reader().get_as::<log_entry::Reader>()?;
+        assert_eq!(entry.get_snowflake_id(), 4);
+        assert_eq!(entry.get_machine_id(), 5);
+        assert_eq!(entry.get_schema(), 6);
+    }
 
     Ok(())
 }

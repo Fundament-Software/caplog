@@ -3,6 +3,7 @@ mod fallthrough;
 mod logsink;
 mod logsource;
 pub mod murmur3;
+mod offset_io;
 mod ring_buf_writer;
 pub mod sorted_map;
 use bitfield_struct::bitfield;
