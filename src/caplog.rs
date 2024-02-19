@@ -11,16 +11,18 @@ use eyre::eyre;
 use eyre::Result;
 use std::alloc;
 use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Seek, Write};
 use std::mem::size_of;
-use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Arc;
+use std::sync::RwLock;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -91,21 +93,30 @@ const MAX_OPEN_FILES: usize = 10;
 
 struct FileManagement {
     max_open_files: usize,
-    files: SortedMap<u128, Option<File>>,
+    files: RwLock<SortedMap<u128, Option<File>>>,
     prefix: PathBuf,
 }
 
 impl FileManagement {
-    pub fn get_data_file(&mut self, id: u128) -> Option<&File> {
-        let e = self.files.range(..=id).last()?;
-        if let Some(_) = e.1.as_ref() {
-            self.files.get(&e.0)?.as_ref()
+    pub fn get_data_file(&mut self, id: u128) -> Option<File> {
+        let k = {
+            let files = self.files.read().ok()?;
+            let e = files.range(..=id).last()?;
+            if let Some(x) = e.1.as_ref() {
+                return x.try_clone().ok();
+            }
+            e.0
+        };
+
+        let mut files = self.files.write().ok()?;
+        let p = self.get_path(id);
+        let v = files.get_mut(&k)?;
+        if let Some(f) = OpenOptions::new().read(true).write(true).open(p).ok() {
+            let result = f.try_clone().ok();
+            *v = Some(f);
+            result
         } else {
-            let k = e.0;
-            let p = self.get_path(id);
-            let v = self.files.get_mut(&k)?;
-            *v = OpenOptions::new().read(true).write(true).open(p).ok();
-            (*v).as_ref()
+            None
         }
     }
 
@@ -124,7 +135,6 @@ impl FileManagement {
             .create(true)
             .open(self.get_path(id).as_path())?;
 
-        file.try_clone();
         header.write_at(&mut file, 0);
         file.flush()?;
         Ok(file)
@@ -149,7 +159,7 @@ pub struct CapLog {
     trie: HashedArrayTrie<u128>,
     //schemas: HashMap<u64, Vec<u8>>,
     staging: StagingAlloc,
-    data_file: RingBufWriter<File, MAX_BUFFER_SIZE>,
+    pub data_file: Arc<RingBufWriter<File, MAX_BUFFER_SIZE>>,
     data_position: u64,
     flush_error: AtomicBool, // This is set if there is a failure writing data to disk, which forces all pending writes to return errors
     last_flush: u64,
@@ -227,7 +237,7 @@ impl CapLog {
         let archive = FileManagement {
             prefix: data_prefix.to_path_buf(),
             max_open_files,
-            files: SortedMap::new(),
+            files: RwLock::new(SortedMap::new()),
         };
 
         let (mut file, id) = if let Some(id) = archive.find_latest_file() {
@@ -265,7 +275,7 @@ impl CapLog {
             max_file_size,
             trie: HashedArrayTrie::new(&storage, 1),
             data_position: file.stream_position()?,
-            data_file: RingBufWriter::new(file),
+            data_file: Arc::new(RingBufWriter::new(file)),
             staging: StagingAlloc {
                 staging: vec![0_u64; MAX_BUFFER_SIZE].into_boxed_slice(),
                 staging_used: false,
@@ -281,7 +291,9 @@ impl CapLog {
             pending: VecDeque::new(),
         };
 
-        log.archive.files.insert(id, Some(file_clone));
+        if let Ok(mut files) = log.archive.files.write() {
+            files.insert(id, Some(file_clone));
+        }
         Ok(log)
     }
 
@@ -330,6 +342,10 @@ impl CapLog {
         // We open a new file handle first so that we can swap it into the ring buffer if necessary
         let mut file = self.archive.new_file(self.current_id)?;
         let position = file.stream_position()?;
+
+        if let Ok(mut files) = self.archive.files.write() {
+            files.insert(id, file.try_clone().ok());
+        }
 
         if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
             // Dump current buffer
@@ -400,13 +416,17 @@ impl CapLog {
         builder.get_payload().set_as(payload)?;
 
         let position = self.data_file.write_position();
-        capnp::serialize_packed::write_message(&mut self.data_file, &message)?;
+        let bypass_arc = unsafe {
+            let extremely_unsafe: *const RingBufWriter<File, MAX_BUFFER_SIZE> = &*self.data_file.as_ref();
+            &mut *(extremely_unsafe as *mut RingBufWriter<File, MAX_BUFFER_SIZE>)
+        };
+        capnp::serialize_packed::write_message(&mut *bypass_arc, &message)?;
         self.trie.insert(id, position)?;
 
         // Asyncronously calculate the hash on the packed data stream and write it into our reserved slot
         //let hash = murmur3_stream(data_file.view(start, end - start)?, end - start, 0)?;
         let hash = 0_u128;
-        self.data_file.write(&hash.to_le_bytes())?;
+        bypass_arc.write(&hash.to_le_bytes())?;
 
         let (sender, receiver) = sync_channel(1);
 
@@ -416,16 +436,18 @@ impl CapLog {
 
     // Every time this is called, write all data that is ready to be flushed to disk
     pub fn flush(&mut self) -> Result<()> {
-        Ok(self.data_file.flush()?)
+        Ok(self.data_file.flush_atomic()?)
     }
 
-    pub fn process_pending(&mut self) {
+    pub fn process_pending(&mut self) -> usize {
         let cur_flush = self.data_file.flush_position();
+        let mut count = 0;
         if self.last_flush < cur_flush {
             while !self.pending.is_empty() {
                 if self.pending.front().unwrap().0 <= cur_flush {
                     // We only get an error if the receiver has stopped existing, which we don't care about
                     let _ = self.pending.pop_front().unwrap().1.send(true);
+                    count += 1;
                 } else {
                     break;
                 }
@@ -433,6 +455,8 @@ impl CapLog {
 
             self.last_flush = cur_flush;
         }
+
+        count
     }
 }
 
@@ -440,6 +464,6 @@ impl Drop for CapLog {
     fn drop(&mut self) {
         self.process_pending();
         let _ = self.trie.storage.borrow_mut().flush();
-        let _ = self.data_file.flush();
+        let _ = self.data_file.flush_atomic();
     }
 }
