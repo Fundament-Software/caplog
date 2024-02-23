@@ -203,7 +203,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
                 flusher.panicked = true;
                 let r = flusher.get_mut().write_all_at(buf, position);
                 flusher.panicked = false;
-                if let Ok(_) = r {
+                if r.is_ok() {
                     state.write_head.store(position + buf.len() as u64, Ordering::Release);
                 }
                 r
