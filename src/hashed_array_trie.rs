@@ -388,9 +388,9 @@ impl HashedArrayStorage {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)?;
+            .open(path)?;
 
-        return Self::new_file(src, new_size);
+        Self::new_file(src, new_size)
     }
 
     #[cfg(miri)]
@@ -468,7 +468,7 @@ impl HashedArrayStorage {
                 let unaligned: &mut [u8] = &mut mapping[byte_offset..byte_end];
                 let header = &mut *(ptr as *mut HashedArrayTrieHeader);
                 let (prefix, slice, _) = unaligned.align_to_mut::<u64>();
-                if prefix.len() > 0 {
+                if !prefix.is_empty() {
                     // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which
                     // is very bad.
                     return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
@@ -522,7 +522,7 @@ impl HashedArrayStorage {
 
             let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
             let prefix = slice.align_to::<u64>().0;
-            if prefix.len() > 0 {
+            if !prefix.is_empty() {
                 return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
             }
             let (header, _) = storage.parts_mut();
@@ -545,7 +545,7 @@ impl HashedArrayStorage {
     #[cfg(not(miri))]
     // Load a file - if it doesn't already exist or is invalid, returns an error
     pub fn load(path: &Path) -> Result<HashedArrayStorage> {
-        Self::load_file(OpenOptions::new().read(true).write(true).create(false).open(&path)?)
+        Self::load_file(OpenOptions::new().read(true).write(true).create(false).open(path)?)
     }
 
     fn scan_valid_nodes(offset: u64, words: &mut [u64], valid: &mut HashSet<u64>) -> bool {
@@ -592,7 +592,7 @@ impl HashedArrayStorage {
 
             assert_eq!(valid_children as u32, mask.count_ones());
 
-            let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset as usize]);
+            let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
             node.set_mask(mask);
             node.set_parity();
 
@@ -613,7 +613,7 @@ impl HashedArrayStorage {
     unsafe fn restore_inner(storage: &mut HashedArrayStorage) -> Result<()> {
         let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
         let prefix = slice.align_to::<u64>().0;
-        if prefix.len() > 0 {
+        if !prefix.is_empty() {
             return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
         }
 
@@ -688,7 +688,7 @@ impl HashedArrayStorage {
 
     #[cfg(not(miri))]
     pub fn restore(path: &Path) -> Result<HashedArrayStorage> {
-        Self::restore_file(OpenOptions::new().read(true).write(true).create(false).open(&path)?)
+        Self::restore_file(OpenOptions::new().read(true).write(true).create(false).open(path)?)
     }
 
     #[cfg(miri)]
@@ -888,7 +888,7 @@ where
         if bits > 5 {
             let count = flags.count();
             for i in 1..=count {
-                Self::verify_trie(words[root as usize + i], bits - 5, &words);
+                Self::verify_trie(words[root as usize + i], bits - 5, words);
             }
         }
     }
@@ -1116,7 +1116,7 @@ where
             .into());
         }
 
-        return Ok(words[offset + node.offset(index) + 1]);
+        Ok(words[offset + node.offset(index) + 1])
     }
 
     fn delete_node(offset: usize, store: &mut RefMut<'_, HashedArrayStorage>, bits: usize, key: K) -> Result<u64> {

@@ -142,7 +142,7 @@ impl FileManagement {
 
         #[cfg(not(miri))]
         // This must NEVER use append(true) because it will subtly break write_at
-        if let Some(f) = OpenOptions::new().read(true).write(true).open(p).ok() {
+        if let Ok(f) = OpenOptions::new().read(true).write(true).open(p) {
             let result = f.try_clone().ok();
             *v = Some(f);
             result
@@ -162,7 +162,7 @@ impl FileManagement {
         let mut path = self.prefix.to_path_buf().into_os_string();
         path.push("_");
         path.push(id.to_string());
-        return path.into();
+        path.into()
     }
 
     pub fn new_file(&self, id: u128) -> Result<FileType> {
@@ -205,7 +205,7 @@ impl FileManagement {
         let pattern = self.prefix.file_name()?.to_str()?;
         let mut highest = None; // 0 is a valid return value here, so this must be a proper Option
 
-        for entry in std::fs::read_dir(&self.prefix.parent()?).ok()? {
+        for entry in std::fs::read_dir(self.prefix.parent()?).ok()? {
             if let Some(x) = Self::check_entry(pattern, entry) {
                 highest = highest.map(|h| std::cmp::max(h, x))
             }
@@ -246,7 +246,7 @@ pub struct CapLog {
     pending: VecDeque<(u64, SyncSender<bool>)>,
 }
 
-unsafe impl<'a> capnp::message::Allocator for StagingAlloc {
+unsafe impl capnp::message::Allocator for StagingAlloc {
     fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
         assert!(minimum_size as usize <= self.staging.len());
         if self.staging_used || minimum_size as usize > self.staging.len() {
@@ -302,13 +302,7 @@ impl CapLog {
         max_open_files: usize,
         check_consistency: bool,
     ) -> Result<Self> {
-        let trie_storage = if let Some(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(false)
-            .open(trie_file)
-            .ok()
-        {
+        let trie_storage = if let Ok(file) = OpenOptions::new().read(true).write(true).create(false).open(trie_file) {
             HashedArrayStorage::load_file(file)?
         } else {
             HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
@@ -340,13 +334,7 @@ impl CapLog {
         #[cfg(not(miri))]
         let (mut file, id) = if let Some(id) = archive.find_latest_file() {
             let data_path = archive.get_path(id);
-            if let Some(mut file) = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(false)
-                .open(data_path)
-                .ok()
-            {
+            if let Ok(mut file) = OpenOptions::new().read(true).write(true).create(false).open(data_path) {
                 // Always check for the clean close flag, if that's not set a recovery pass should be done
                 let mut headerstartbuf = [0_u8; size_of::<HeaderStart>()];
                 file.read_at(&mut headerstartbuf, 0)?;
@@ -551,7 +539,7 @@ impl CapLog {
             }
 
             self.trie.insert(id, position)?;
-            handle.write(&self.staging.consume_hash().to_le_bytes())?;
+            handle.write_all(&self.staging.consume_hash().to_le_bytes())?;
         } else {
             let position = self.data_file.write_position();
             let handle = &mut self.data_file.as_ref();
@@ -564,7 +552,7 @@ impl CapLog {
 
             // Reborrow because write_message consumes it's handle for no reason
             let handle = &mut self.data_file.as_ref();
-            handle.write(&self.staging.consume_hash().to_le_bytes())?;
+            handle.write_all(&self.staging.consume_hash().to_le_bytes())?;
         }
 
         let (sender, receiver) = sync_channel(1);
