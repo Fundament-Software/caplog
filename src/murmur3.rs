@@ -1,17 +1,9 @@
-// Based on the fastmurmur3 crate, but modified to work on a generic Read trait
+// Based on the fastmurmur3 crate, but modified to work on an aligned u64 buffer
 
-use crate::{
-    match_fallthrough, match_fallthrough_make_loops, match_fallthrough_make_match, match_fallthrough_reverse_branches,
-};
-use std::io::Read;
-use std::ops::Shl;
+use num::Integer;
 
-#[allow(unreachable_code)]
 #[inline]
-pub fn murmur3_stream<R>(mut data: R, len: usize, seed: u64) -> Result<u128, std::io::Error>
-where
-    R: Read,
-{
+pub fn murmur3_aligned_inner(mut data: &[u64], seed: u128, accumulator: usize) -> u128 {
     const C1: u64 = 0x87c3_7b91_1142_53d5;
     const C2: u64 = 0x4cf5_ad43_2745_937f;
     const C3: u64 = 0x52dc_e729;
@@ -20,73 +12,58 @@ where
     const R2: u32 = 31;
     const R3: u32 = 33;
     const M: u64 = 5;
-    const BLOCK_SIZE: usize = 16;
-    const HALF_BLOCK_SIZE: usize = BLOCK_SIZE / 2;
-    let mut trailing_len = len;
+    const BLOCK_SIZE: usize = 16 / std::mem::size_of::<u64>();
 
-    let mut h1: u64 = seed;
-    let mut h2: u64 = seed;
-    let mut buf: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
+    let [mut h1, mut h2] = unsafe { std::mem::transmute::<u128, [u64; 2]>(seed) };
 
-    while trailing_len >= BLOCK_SIZE {
-        data.read_exact(&mut buf)?;
-        trailing_len -= BLOCK_SIZE;
+    // If offset is set, the last run of murmur only processed half of h1
+    if accumulator.is_odd() && data.len() > 0 {
+        let k2 = data[0];
+        h1 = h1.rotate_left(R1).wrapping_add(h2).wrapping_mul(M).wrapping_add(C3);
+        h2 ^= k2.wrapping_mul(C2).rotate_left(R3).wrapping_mul(C1);
+        h2 = h2.rotate_left(R2).wrapping_add(h1).wrapping_mul(M).wrapping_add(C4);
+        data = &data[1..];
+    }
 
-        let k1 = u64::from_le_bytes(unsafe { *(buf.as_ptr() as *const [u8; HALF_BLOCK_SIZE]) });
-        let k2 = u64::from_le_bytes(unsafe {
-            *(buf.as_ptr().offset(HALF_BLOCK_SIZE as isize) as *const [u8; HALF_BLOCK_SIZE])
-        });
+    while data.len() >= BLOCK_SIZE {
+        let k1 = data[0];
+        let k2 = data[1];
         h1 ^= k1.wrapping_mul(C1).rotate_left(R2).wrapping_mul(C2);
         h1 = h1.rotate_left(R1).wrapping_add(h2).wrapping_mul(M).wrapping_add(C3);
         h2 ^= k2.wrapping_mul(C2).rotate_left(R3).wrapping_mul(C1);
         h2 = h2.rotate_left(R2).wrapping_add(h1).wrapping_mul(M).wrapping_add(C4);
+
+        data = &data[BLOCK_SIZE..];
     }
 
-    data.read_exact(&mut buf[..trailing_len])?;
-    let mut k1 = 0;
-    let mut k2 = 0;
-    // this macro saves about 8% on performance compared to a huge if statement.
-    match_fallthrough!(trailing_len, {
-        15 => k2 ^= (buf[14] as u64).shl(48),
-        14 => k2 ^= (buf[13] as u64).shl(40),
-        13 => k2 ^= (buf[12] as u64).shl(32),
-        12 => k2 ^= (buf[11] as u64).shl(24),
-        11 => k2 ^= (buf[10] as u64).shl(16),
-        10 => k2 ^= (buf[9] as u64).shl(8),
-        9 => {
-            k2 ^= buf[8] as u64;
-            k2 = k2.wrapping_mul(C2)
-                .rotate_left(33)
-                .wrapping_mul(C1);
-            h2 ^= k2;
-        },
-        8 => k1 ^= (buf[7] as u64).shl(56),
-        7 => k1 ^= (buf[6] as u64).shl(48),
-        6 => k1 ^= (buf[5] as u64).shl(40),
-        5 => k1 ^= (buf[4] as u64).shl(32),
-        4 => k1 ^= (buf[3] as u64).shl(24),
-        3 => k1 ^= (buf[2] as u64).shl(16),
-        2 => k1 ^= (buf[1] as u64).shl(8),
-        1 => k1 ^= buf[0] as u64,
-        0 => {
-            k1 = k1.wrapping_mul(C1)
-                .rotate_left(R2)
-                .wrapping_mul(C2);
-            h1 ^= k1;
-            break;
-        },
-        _ => unreachable!()
-    });
+    if data.len() > 0 {
+        assert_eq!(data.len(), 1);
+        let k1 = data[0];
+        h1 ^= k1.wrapping_mul(C1).rotate_left(R2).wrapping_mul(C2);
+    }
 
-    h1 ^= len as u64;
-    h2 ^= len as u64;
+    unsafe { std::mem::transmute::<[u64; 2], u128>([h1, h2]) }
+}
+
+pub fn murmur3_finalize(mut total_len: usize, seed: u128) -> u128 {
+    total_len *= std::mem::size_of::<u64>();
+    let [mut h1, mut h2] = unsafe { std::mem::transmute::<u128, [u64; 2]>(seed) };
+
+    h1 ^= total_len as u64;
+    h2 ^= total_len as u64;
     h1 = h1.wrapping_add(h2);
     h2 = h2.wrapping_add(h1);
     h1 = fmix64(h1);
     h2 = fmix64(h2);
     h1 = h1.wrapping_add(h2);
     h2 = h2.wrapping_add(h1);
-    Ok(u128::from_ne_bytes(unsafe { *([h1, h2].as_ptr() as *const [u8; 16]) }))
+
+    unsafe { std::mem::transmute::<[u64; 2], u128>([h1, h2]) }
+}
+
+#[inline]
+pub fn murmur3_aligned(data: &[u64], seed: u128) -> u128 {
+    murmur3_finalize(data.len(), murmur3_aligned_inner(data, seed, 0))
 }
 
 trait XorShift {
@@ -114,27 +91,65 @@ mod test {
     use super::*;
     use rand::{Rng, RngCore};
 
-    static SOURCE: &'static [u8] = b"The quick brown fox jumps over the lazy dog";
+    static SOURCE: &'static [u8; 40] = b"The quick brown fox jumps over the lazy ";
 
     #[test]
     fn test_agreement_basic() {
-        let a = murmur3_stream(SOURCE, SOURCE.len(), 0).unwrap();
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let a = murmur3_aligned(&aligned, 0);
         let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        assert_eq!(a, b);
+
+        let a = murmur3_aligned(&aligned, 12345 | 12345_u128 << 64);
+        let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 12345).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    fn test_agreement_split() {
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let a1 = murmur3_aligned_inner(&aligned[0..2], 0, 0);
+        let a2 = murmur3_aligned_inner(&aligned[2..], a1, 2);
+        let a = murmur3_finalize(aligned.len(), a2);
+        let b = murmur3_aligned(&aligned, 0);
+
+        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        assert_eq!(b, c);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_agreement_odd_split() {
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let a1 = murmur3_aligned_inner(&aligned[0..3], 0, 0);
+        let a2 = murmur3_aligned_inner(&aligned[3..], a1, 3);
+        let a = murmur3_finalize(aligned.len(), a2);
+        let b = murmur3_aligned(&aligned, 0);
+
+        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        assert_eq!(b, c);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn test_agreement_fuzzed() {
         let mut rng = rand::thread_rng();
 
-        for i in 0..10000 {
+        #[cfg(miri)]
+        const MAXCOUNT: usize = 10;
+        #[cfg(not(miri))]
+        const MAXCOUNT: usize = 10000;
+
+        for i in 0..MAXCOUNT {
             let len: u8 = rng.gen();
-            let mut buf = vec![0; len as usize];
-            rng.fill_bytes(&mut buf[..]);
+            let mut buf: Vec<u64> = vec![0; len as usize];
+            let (_, inner, _) = unsafe { buf.align_to_mut::<u8>() };
+            rng.fill_bytes(inner);
             let salt: u32 = rng.gen();
-            let a = murmur3_stream(&buf[..], buf.len(), salt as u64).unwrap();
-            let b = murmur3::murmur3_x64_128(&mut Cursor::new(&buf), salt).unwrap();
+            let b = murmur3::murmur3_x64_128(&mut Cursor::new(inner), salt).unwrap();
+            let a = murmur3_aligned(&buf[..], salt as u128 | (salt as u128) << 64);
             assert_eq!(
                 a,
                 b,

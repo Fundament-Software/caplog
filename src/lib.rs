@@ -1,5 +1,4 @@
 mod caplog;
-mod fallthrough;
 mod logsink;
 mod logsource;
 pub mod murmur3;
@@ -9,10 +8,11 @@ pub mod sorted_map;
 use bitfield_struct::bitfield;
 mod hashed_array_trie;
 capnp_import::capnp_import!("log.capnp");
+#[cfg(miri)]
+mod fakefile;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn it_works() {}

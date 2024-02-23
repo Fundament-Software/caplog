@@ -144,6 +144,11 @@ impl<'a, R: OffsetRead, const SIZE: usize> ReadSessionBuf<'a, R, SIZE> {
     }
 
     #[inline]
+    pub fn get_position(&self) -> u64 {
+        self.pos as u64
+    }
+
+    #[inline]
     pub fn buffer(&self) -> &[u8] {
         // SAFETY: self.pos and self.cap are valid, and self.cap => self.pos, and
         // that region is initialized because those are all invariants of this type.
@@ -174,7 +179,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> ReadSessionBuf<'a, R, SIZE> {
     }
 }
 
-impl<'a, R: OffsetRead, const SIZE: usize> Read for ReadSessionBuf<'a, R, SIZE> {
+impl<'a, R: OffsetRead, const SIZE: usize> Read for &'_ mut ReadSessionBuf<'a, R, SIZE> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // If we don't have any buffered data and we're doing a massive read
         // (larger than our internal buffer), bypass our internal buffer
@@ -222,7 +227,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> Read for ReadSessionBuf<'a, R, SIZE> 
     }
 }
 
-impl<'a, R: OffsetRead, const SIZE: usize> BufRead for ReadSessionBuf<'a, R, SIZE> {
+impl<'a, R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'a, R, SIZE> {
     #[inline]
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         // If we've reached the end of our internal buffer then we need to fetch

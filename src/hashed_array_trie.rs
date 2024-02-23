@@ -7,7 +7,6 @@ use memmap2::MmapMut;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::HashSet;
-use std::default::Default;
 use std::fs::File;
 #[cfg(not(miri))]
 use std::fs::OpenOptions;
@@ -1427,6 +1426,7 @@ fn test_fill_node() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_fill_trie() -> Result<()> {
     #[cfg(not(miri))]
@@ -1498,6 +1498,7 @@ fn test_fill_trie() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_fill_random() -> Result<()> {
     #[cfg(not(miri))]
