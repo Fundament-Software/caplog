@@ -501,6 +501,7 @@ impl CapLog {
         &mut self,
         snowflake: u64,
         machine: u64,
+        instance: u64,
         schema: u64,
         payload: capnp::any_pointer::Reader<'_>,
         size: usize,
@@ -525,6 +526,7 @@ impl CapLog {
         let mut builder: log_entry::Builder<'_> = message.init_root();
         builder.set_snowflake_id(snowflake);
         builder.set_machine_id(machine);
+        builder.set_instance_id(instance);
         builder.set_schema(schema);
         builder.get_payload().set_as(payload)?;
 
