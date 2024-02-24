@@ -302,9 +302,9 @@ impl HashedArrayStorage {
         // We do this alignment check once, and the rest of the time we do the unguarded direct mutation.
         let (prefix, slice, tail) = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>();
 
-        if prefix.len() > 0 {
+        if !prefix.is_empty() {
             return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
-        } else if tail.len() > 0 {
+        } else if !tail.is_empty() {
             return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), tail.len()).into());
         }
 

@@ -29,13 +29,20 @@ impl Future for LogFuture {
 
 #[capnproto_rpc(log_sink)]
 impl log_sink::Server for CapLog {
-    fn log(&mut self, snowflake_id: u64, machine_id: u64, schema: u64, payload: ::capnp::data::Reader) {
+    fn log(
+        &mut self,
+        snowflake_id: u64,
+        machine_id: u64,
+        instance_id: u64,
+        schema: u64,
+        payload: ::capnp::data::Reader,
+    ) {
         let _ = schema;
         const EXTRA_WORDS: usize = 4;
         let size = ::capnp_rpc::pry!(rparams.total_size());
         let words = size.word_count as usize + size.cap_count as usize + EXTRA_WORDS;
 
-        match self.append(snowflake_id, machine_id, schema, payload, words) {
+        match self.append(snowflake_id, machine_id, instance_id, schema, payload, words) {
             Ok(receiver) => Promise::from_future(LogFuture { receiver }),
             Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
         }
@@ -72,12 +79,14 @@ async fn test_basic_log() -> Result<()> {
         {
             request.get().set_snowflake_id(1);
             request.get().set_machine_id(2);
+            request.get().set_instance_id(3);
             request.get().set_schema(0);
             let payload = request.get().init_payload();
             let mut builder = payload.init_as::<log_entry::Builder>();
             builder.set_snowflake_id(4);
             builder.set_machine_id(5);
-            builder.set_schema(6);
+            builder.set_instance_id(6);
+            builder.set_schema(7);
         }
         let mut result = request.send().promise;
         if let Poll::Ready(_) = futures::poll!(&mut result) {
@@ -97,7 +106,8 @@ async fn test_basic_log() -> Result<()> {
         let entry = root.into_reader().get_as::<log_entry::Reader>()?;
         assert_eq!(entry.get_snowflake_id(), 4);
         assert_eq!(entry.get_machine_id(), 5);
-        assert_eq!(entry.get_schema(), 6);
+        assert_eq!(entry.get_instance_id(), 6);
+        assert_eq!(entry.get_schema(), 7);
     }
 
     Ok(())
@@ -129,12 +139,14 @@ async fn test_basic_threading() -> Result<()> {
         {
             request.get().set_snowflake_id(1);
             request.get().set_machine_id(2);
+            request.get().set_instance_id(3);
             request.get().set_schema(0);
             let payload = request.get().init_payload();
             let mut builder = payload.init_as::<log_entry::Builder>();
             builder.set_snowflake_id(4);
             builder.set_machine_id(5);
-            builder.set_schema(6);
+            builder.set_instance_id(6);
+            builder.set_schema(7);
         }
         let mut result = request.send().promise;
         if let Poll::Ready(_) = futures::poll!(&mut result) {
@@ -156,7 +168,8 @@ async fn test_basic_threading() -> Result<()> {
         let entry = root.into_reader().get_as::<log_entry::Reader>()?;
         assert_eq!(entry.get_snowflake_id(), 4);
         assert_eq!(entry.get_machine_id(), 5);
-        assert_eq!(entry.get_schema(), 6);
+        assert_eq!(entry.get_instance_id(), 6);
+        assert_eq!(entry.get_schema(), 7);
     }
 
     Ok(())
@@ -184,9 +197,10 @@ fn test_basic_miri() -> eyre::Result<()> {
         let mut builder = anypointer.init_as::<log_entry::Builder>();
         builder.set_snowflake_id(4);
         builder.set_machine_id(5);
-        builder.set_schema(6);
+        builder.set_instance_id(6);
+        builder.set_schema(7);
 
-        let result = logger.append(1, 2, 0, payload.get_root_as_reader()?, 10)?;
+        let result = logger.append(1, 2, 3, 0, payload.get_root_as_reader()?, 10)?;
         println!("append finish");
 
         if let Ok(_) = result.try_recv() {
@@ -204,7 +218,8 @@ fn test_basic_miri() -> eyre::Result<()> {
         let entry = root.into_reader().get_as::<log_entry::Reader>()?;
         assert_eq!(entry.get_snowflake_id(), 4);
         assert_eq!(entry.get_machine_id(), 5);
-        assert_eq!(entry.get_schema(), 6);
+        assert_eq!(entry.get_instance_id(), 6);
+        assert_eq!(entry.get_schema(), 7);
     }
 
     Ok(())
