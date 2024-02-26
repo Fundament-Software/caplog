@@ -3,7 +3,7 @@ use crate::murmur3::{murmur3_aligned, murmur3_aligned_inner, murmur3_finalize};
 use crate::offset_io::{OffsetRead, OffsetWrite, ReadSessionBuf};
 use crate::ring_buf_writer::RingBufWriter;
 
-use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie};
+use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie, HashedArrayTrieError};
 
 use super::sorted_map::SortedMap;
 use capnp::message::{self, Allocator, ReaderOptions, TypedReader};
@@ -34,8 +34,8 @@ pub enum CapLogError {
     OutOfBounds { v: u64, minimum: u64, maximum: u64 },
     #[error("Expected schema hash {0} but found {1}")]
     InvalidSchema(u64, u64),
-    #[error("Data ID {0} doesn't match Trie ID {1}")]
-    Mismatch(u128, u128),
+    #[error("Data ID {0} doesn't match Trie ID {1} ({2}, {3})")]
+    Mismatch(u128, u128, u64, u64),
     #[error("Data failed integrity check (got {0} but expected {1})")]
     CorruptData(u128, u128),
     #[error("the data for key `{0}` is not available")]
@@ -92,9 +92,9 @@ impl HeaderStart {
 pub const MAX_FILE_SIZE: u64 = 2_u64.pow(28);
 pub const MAX_OPEN_FILES: usize = 10;
 #[cfg(not(miri))]
-const MAX_BUFFER_SIZE: usize = 2_usize.pow(22);
+pub const MAX_BUFFER_SIZE: usize = 2_usize.pow(22);
 #[cfg(miri)]
-const MAX_BUFFER_SIZE: usize = 2_usize.pow(11);
+pub const MAX_BUFFER_SIZE: usize = 2_usize.pow(11);
 
 #[cfg(not(miri))]
 type FileType = File;
@@ -232,12 +232,12 @@ impl StagingAlloc {
 }
 
 /// A high-performance append-only log
-pub struct CapLog {
+pub struct CapLog<const BUFFER_SIZE: usize> {
     max_file_size: u64,
     trie: HashedArrayTrie<u128>,
     //schemas: HashMap<u64, Vec<u8>>,
     staging: StagingAlloc,
-    pub data_file: Arc<RingBufWriter<FileType, MAX_BUFFER_SIZE>>,
+    pub data_file: Arc<RingBufWriter<FileType, BUFFER_SIZE>>,
     flush_error: AtomicBool, // This is set if there is a failure writing data to disk, which forces all pending writes to return errors
     last_flush: u64,
     current_id: u128,
@@ -248,10 +248,8 @@ pub struct CapLog {
 
 unsafe impl capnp::message::Allocator for StagingAlloc {
     fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
-        assert!(minimum_size as usize <= self.staging.len());
         if self.staging_used || minimum_size as usize > self.staging.len() {
             let layout = alloc::Layout::from_size_align(minimum_size as usize * size_of::<u64>(), 8).unwrap();
-            // if this happens in release mode, we can't crash, we have to just handle it anyway
             unsafe { (alloc::alloc_zeroed(layout), minimum_size) }
         } else {
             self.staging_used = true;
@@ -293,7 +291,7 @@ fn alloc_test() -> Result<()> {
     Ok(())
 }
 
-impl CapLog {
+impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     #[cfg(not(miri))]
     pub fn new(
         max_file_size: u64,
@@ -371,7 +369,7 @@ impl CapLog {
             trie: HashedArrayTrie::new(&storage, 1),
             data_file: Arc::new(RingBufWriter::new(file, position)),
             staging: StagingAlloc {
-                staging: vec![0_u64; MAX_BUFFER_SIZE / size_of::<u64>()].into_boxed_slice(),
+                staging: vec![0_u64; BUFFER_SIZE / size_of::<u64>()].into_boxed_slice(),
                 staging_used: false,
                 hash: 0,
                 hash_len: 0,
@@ -443,9 +441,11 @@ impl CapLog {
 
         let message = TypedReader::<_, log_entry::Owned>::new(reader);
         let entry = message.get()?;
-        let entry_id = ((entry.get_machine_id() as u128) << 64) | entry.get_snowflake_id() as u128;
+        let machine_id = entry.get_machine_id();
+        let snowflake_id = entry.get_snowflake_id();
+        let entry_id = ((machine_id as u128) << 64) | snowflake_id as u128;
         if entry_id != id {
-            return Err(CapLogError::Mismatch(entry_id, id).into());
+            return Err(CapLogError::Mismatch(entry_id, id, (id >> 64) as u64, id as u64).into());
         }
 
         builder.set_as(entry.get_payload())?;
@@ -454,8 +454,7 @@ impl CapLog {
 
     fn reset(&mut self, id: u128) -> Result<()> {
         // We open a new file handle first so that we can swap it into the ring buffer if necessary
-        let mut file = self.archive.new_file(self.current_id)?;
-        let position = file.stream_position()?;
+        let mut file = self.archive.new_file(id)?;
 
         if let Ok(mut files) = self.archive.files.write() {
             files.insert(id, file.try_clone().ok());
@@ -463,7 +462,7 @@ impl CapLog {
 
         if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
             // Dump current buffer
-            flusher.flush_buf::<MAX_BUFFER_SIZE>(state)?;
+            flusher.flush_buf::<BUFFER_SIZE>(state)?;
             flusher.get_mut().flush()?;
 
             //  Write clean header flag
@@ -480,7 +479,7 @@ impl CapLog {
 
             let position = file.stream_position()?;
             // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
-            flusher.swap_inner::<MAX_BUFFER_SIZE>(state, &mut file, position)?;
+            flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position)?;
 
             self.trie.storage.borrow_mut().flush()?;
         } else {
@@ -495,6 +494,17 @@ impl CapLog {
 
     pub fn check_write_size(&mut self, size: usize) -> bool {
         self.data_file.write_position() + size as u64 > self.max_file_size
+    }
+
+    #[inline]
+    fn trie_insert(&mut self, id: u128, value: u64) -> Result<()> {
+        while let Err(e) = self.trie.insert(id, value) {
+            match e.downcast::<HashedArrayTrieError>()? {
+                HashedArrayTrieError::OutOfMemory(_) => self.trie.storage.borrow_mut().resize(),
+                err => Err(err.into()),
+            }?;
+        }
+        Ok(())
     }
 
     pub fn append(
@@ -540,6 +550,7 @@ impl CapLog {
                 capnp::serialize_packed::write_message(&mut handle, &message)?;
             }
 
+            self.trie_insert(id, position)?;
             self.trie.insert(id, position)?;
             handle.write_all(&self.staging.consume_hash().to_le_bytes())?;
         } else {
@@ -550,7 +561,7 @@ impl CapLog {
                 capnp::serialize_packed::write_message(handle, &message)?;
             }
 
-            self.trie.insert(id, position)?;
+            self.trie_insert(id, position)?;
 
             // Reborrow because write_message consumes it's handle for no reason
             let handle = &mut self.data_file.as_ref();
@@ -590,7 +601,7 @@ impl CapLog {
     }
 }
 
-impl Drop for CapLog {
+impl<const BUFFER_SIZE: usize> Drop for CapLog<BUFFER_SIZE> {
     fn drop(&mut self) {
         self.process_pending();
         let _ = self.trie.storage.borrow_mut().flush();
