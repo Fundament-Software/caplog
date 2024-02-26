@@ -268,7 +268,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
             staging[..(end % SIZE)].copy_from_slice(&src[(SIZE - start)..]);
         }
 
-        self.state.marker.store(end, Ordering::Release);
+        self.state.marker.store(end % SIZE, Ordering::Release);
     }
 
     pub fn lock_flusher(
