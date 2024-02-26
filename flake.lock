@@ -16,6 +16,23 @@
         "type": "github"
       }
     },
+    "capnproto-fs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1707465215,
+        "narHash": "sha256-PYDsB6YNnV3rb5jVutFbXXoaUyAWEtqKM0ixP8rkvao=",
+        "owner": "Fundament-Software",
+        "repo": "capnproto",
+        "rev": "b8607c4aa84c283a58e7b8d7c27ec8683bccf15e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Fundament-Software",
+        "ref": "v2",
+        "repo": "capnproto",
+        "type": "github"
+      }
+    },
     "crane": {
       "inputs": {
         "nixpkgs": [
@@ -122,6 +139,7 @@
     "root": {
       "inputs": {
         "advisory-db": "advisory-db",
+        "capnproto-fs": "capnproto-fs",
         "crane": "crane",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",

@@ -54,7 +54,7 @@ impl OffsetRead for File {
 impl<R: ?Sized + std::os::unix::fs::FileExt> OffsetRead for BufReader<R> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         use std::os::unix::prelude::FileExt;
-        FileExt::read_at(self, buf, offset)
+        FileExt::read_at(self.get_ref(), buf, offset)
     }
 }
 
