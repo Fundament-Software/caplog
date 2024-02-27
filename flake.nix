@@ -13,6 +13,11 @@
       url = "github:rustsec/advisory-db";
       flake = false;
     };
+
+    capnproto-fs = {
+      url = "github:Fundament-Software/capnproto?ref=v2";
+      flake = false;
+    };
   };
 
   outputs =
@@ -37,6 +42,14 @@
           "llvm-tools-preview"
           "rust-analyzer-preview"
         ];
+      });
+
+      capnproto = (pkgs.clangStdenv.mkDerivation {
+        pname = "capnproto";
+        version = "v2";
+        src = inputs.capnproto-fs;
+        nativeBuildInputs = [ pkgs.cmake ];
+        propagatedBuildInputs = [ pkgs.openssl pkgs.zlib ];
       });
       
       rust-nightly-toolchain = (pkgs.rust-bin.nightly.latest.default.override {

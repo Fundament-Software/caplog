@@ -288,7 +288,7 @@ async fn test_buffer_loop() -> Result<()> {
             let mut logger = hook.borrow_mut();
             let mut message = capnp::message::Builder::new_default();
             let mut root = message.init_root();
-            logger.get_log(i * 10 + 2, i * 10 + 3, true, &mut root)?;
+            logger.get_log(i * 10 + 2, i * 10 + 3, false, &mut root)?;
             check_payload(i, root.into_reader().get_as::<log_entry::Reader>()?);
         }
     }
@@ -328,7 +328,7 @@ fn test_buffer_bypass() -> eyre::Result<()> {
         let mut message = capnp::message::Builder::new_default();
         let mut root = message.init_root();
 
-        logger.get_log(2, 3, false, &mut root)?;
+        logger.get_log(2, 3, true, &mut root)?;
 
         check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
     }

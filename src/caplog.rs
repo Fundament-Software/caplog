@@ -78,12 +78,13 @@ impl HeaderStart {
     }
 
     #[inline]
-    pub fn write_at<T>(&self, target: &mut T, offset: u64) -> Result<()>
+    pub fn write_at<T>(&self, target: &mut T, offset: u64) -> Result<usize>
     where
         T: OffsetWrite,
     {
-        target.write_all_at(&u64::to_le_bytes(self.flags), offset)?;
-        Ok(())
+        let bytes = u64::to_le_bytes(self.flags);
+        target.write_all_at(&bytes, offset)?;
+        Ok(bytes.len())
     }
 }
 
@@ -180,6 +181,7 @@ impl FileManagement {
 
         header.write_at(&mut file, 0)?;
         file.flush()?;
+        file.seek(std::io::SeekFrom::End(0))?;
         Ok(file)
     }
 
@@ -518,7 +520,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
             let position = file.stream_position()?;
             // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
-            flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position)?;
+            flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position as u64)?;
 
             self.trie.storage.borrow_mut().flush()?;
         } else {
