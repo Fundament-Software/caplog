@@ -195,6 +195,39 @@ impl FileManagement {
         }
     }
 
+    #[inline]
+    pub fn get_file_iterator(
+        prefix: &Path,
+    ) -> std::io::Result<impl Iterator<Item = std::io::Result<std::fs::DirEntry>> + '_> {
+        let pattern = prefix
+            .file_name()
+            .ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Prefix had no filename",
+            ))?
+            .to_str()
+            .ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Prefix contained invalid utf8",
+            ))?;
+        Ok(std::fs::read_dir(prefix.parent().ok_or(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Prefix was bare filename",
+        ))?)?
+        .filter(move |x| {
+            if let Ok(entry) = x {
+                let name = entry.file_name();
+                if let Some(s) = name.as_os_str().to_str() {
+                    s.starts_with(pattern)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }))
+    }
+
     #[cfg(miri)]
     pub fn find_latest_file(&self) -> Option<u128> {
         None
@@ -389,6 +422,12 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             files.insert(id, Some(file_clone));
         }
         Ok(log)
+    }
+
+    pub fn get_all_files(
+        prefix: &Path,
+    ) -> std::io::Result<impl Iterator<Item = std::io::Result<std::fs::DirEntry>> + '_> {
+        FileManagement::get_file_iterator(prefix)
     }
 
     #[inline]
