@@ -14,7 +14,8 @@ pub fn murmur3_aligned_inner(mut data: &[u64], seed: u128, accumulator: usize) -
     const M: u64 = 5;
     const BLOCK_SIZE: usize = 16 / std::mem::size_of::<u64>();
 
-    let [mut h1, mut h2] = unsafe { std::mem::transmute::<u128, [u64; 2]>(seed) };
+    let mut h1 = seed as u64;
+    let mut h2 = (seed >> 64) as u64;
 
     // If offset is set, the last run of murmur only processed half of h1
     if accumulator.is_odd() && !data.is_empty() {
@@ -42,12 +43,13 @@ pub fn murmur3_aligned_inner(mut data: &[u64], seed: u128, accumulator: usize) -
         h1 ^= k1.wrapping_mul(C1).rotate_left(R2).wrapping_mul(C2);
     }
 
-    unsafe { std::mem::transmute::<[u64; 2], u128>([h1, h2]) }
+    h1 as u128 | ((h2 as u128) << 64)
 }
 
 pub fn murmur3_finalize(mut total_len: usize, seed: u128) -> u128 {
     total_len *= std::mem::size_of::<u64>();
-    let [mut h1, mut h2] = unsafe { std::mem::transmute::<u128, [u64; 2]>(seed) };
+    let mut h1 = seed as u64;
+    let mut h2 = (seed >> 64) as u64;
 
     h1 ^= total_len as u64;
     h2 ^= total_len as u64;
@@ -58,7 +60,7 @@ pub fn murmur3_finalize(mut total_len: usize, seed: u128) -> u128 {
     h1 = h1.wrapping_add(h2);
     h2 = h2.wrapping_add(h1);
 
-    unsafe { std::mem::transmute::<[u64; 2], u128>([h1, h2]) }
+    h1 as u128 | ((h2 as u128) << 64)
 }
 
 #[inline]
