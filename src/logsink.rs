@@ -2,12 +2,13 @@ use super::caplog::{CapLog, MAX_BUFFER_SIZE};
 use super::log_capnp::log_sink;
 #[cfg(not(miri))]
 use crate::log_capnp::log_source::Server;
-use capnp::any_pointer;
 use capnp::capability::Promise;
 #[cfg(not(miri))]
 use capnp::message::ReaderSegments;
+use capnp::{any_pointer, data};
 use capnp_macros::capnproto_rpc;
 use core::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
@@ -62,6 +63,47 @@ use std::sync::Arc;
 #[cfg(test)]
 use tempfile::NamedTempFile;
 
+#[cfg(miri)]
+#[cfg(test)]
+struct TempFileGuard {
+    prefix: &'static std::path::Path,
+}
+
+#[cfg(not(miri))]
+#[cfg(test)]
+struct TempFileGuard {
+    prefix: tempfile::TempPath,
+}
+
+#[cfg(test)]
+impl TempFileGuard {
+    fn new() -> Self {
+        #[cfg(not(miri))]
+        return TempFileGuard {
+            prefix: NamedTempFile::new().unwrap().into_temp_path(),
+        };
+
+        #[cfg(miri)]
+        TempFileGuard {
+            prefix: std::path::Path::new("/"),
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[cfg(test)]
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Ok(files) = CapLog::<128>::get_all_files(&self.prefix) {
+            for file in files {
+                if let Ok(f) = file {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn gen_anypointer_message<'a>(index: u64, anypointer: ::capnp::any_pointer::Builder<'a>) -> log_entry::Builder<'a> {
     let mut builder = anypointer.init_as::<log_entry::Builder>();
@@ -89,11 +131,10 @@ fn check_payload(index: u64, entry: log_entry::Reader) {
     assert_eq!(entry.get_schema(), index * 10 + 8);
 }
 
-//#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn test_basic_log() -> Result<()> {
-    //let data_prefix = NamedTempFile::new()?;
-    let data_prefix = NamedTempFile::new()?;
+    let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
@@ -101,7 +142,7 @@ async fn test_basic_log() -> Result<()> {
         let client: log_sink::Client = set.new_client(CapLog::<MAX_BUFFER_SIZE>::new_storage(
             65535,
             trie_storage,
-            data_prefix.path(),
+            &guard.prefix,
             10,
             false,
         )?);
@@ -130,14 +171,14 @@ async fn test_basic_log() -> Result<()> {
     Ok(())
 }
 
-//#[cfg_attr(miri, ignore)]
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn test_basic_threading() -> Result<()> {
-    let data_prefix = NamedTempFile::new()?;
+    let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
-        let logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, data_prefix.path(), 10, false)?;
+        let logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
         let flusher = Arc::downgrade(&logger.data_file.clone());
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client = set.new_client(logger);
@@ -178,12 +219,7 @@ async fn test_basic_threading() -> Result<()> {
 
 #[test]
 fn test_basic_miri() -> eyre::Result<()> {
-    #[cfg(not(miri))]
-    let data_prefix = NamedTempFile::new()?;
-    #[cfg(not(miri))]
-    let data_prefix = data_prefix.path();
-    #[cfg(miri)]
-    let data_prefix = std::path::Path::new("/");
+    let guard = TempFileGuard::new();
 
     #[cfg(not(miri))]
     let trie_file = NamedTempFile::new()?;
@@ -194,7 +230,7 @@ fn test_basic_miri() -> eyre::Result<()> {
         #[cfg(miri)]
         let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
-        let mut logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, data_prefix, 10, false)?;
+        let mut logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
 
         // log request
         let mut payload = capnp::message::Builder::new_default();
@@ -202,7 +238,6 @@ fn test_basic_miri() -> eyre::Result<()> {
         gen_anypointer_message(0, anypointer);
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
-        println!("append finish");
 
         if let Ok(_) = result.try_recv() {
             assert!(false, "Promise shouldn't be ready yet!");
@@ -225,14 +260,13 @@ fn test_basic_miri() -> eyre::Result<()> {
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn test_buffer_loop() -> Result<()> {
-    //let data_prefix = NamedTempFile::new()?;
-    let data_prefix = std::path::Path::new("D:/TEST_FILE");
+    let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client =
-            set.new_client(CapLog::<128>::new_storage(512, trie_storage, data_prefix, 10, false)?);
+            set.new_client(CapLog::<128>::new_storage(512, trie_storage, &guard.prefix, 10, false)?);
 
         for i in 0..0xFF {
             // log request
@@ -264,12 +298,7 @@ async fn test_buffer_loop() -> Result<()> {
 
 #[test]
 fn test_buffer_bypass() -> eyre::Result<()> {
-    #[cfg(not(miri))]
-    let data_prefix = NamedTempFile::new()?;
-    #[cfg(not(miri))]
-    let data_prefix = data_prefix.path();
-    #[cfg(miri)]
-    let data_prefix = std::path::Path::new("/");
+    let guard = TempFileGuard::new();
 
     #[cfg(not(miri))]
     let trie_file = NamedTempFile::new()?;
@@ -280,7 +309,7 @@ fn test_buffer_bypass() -> eyre::Result<()> {
         #[cfg(miri)]
         let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
-        let mut logger = CapLog::<8>::new_storage(65535, trie_storage, data_prefix, 10, false)?;
+        let mut logger = CapLog::<8>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
 
         // log request
         let mut payload = capnp::message::Builder::new_default();
@@ -288,7 +317,6 @@ fn test_buffer_bypass() -> eyre::Result<()> {
         gen_anypointer_message(0, anypointer);
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
-        println!("append finish");
 
         if let Ok(_) = result.try_recv() {
             assert!(false, "Promise shouldn't be ready yet!");
@@ -310,12 +338,7 @@ fn test_buffer_bypass() -> eyre::Result<()> {
 
 #[test]
 fn test_file_bypass() -> eyre::Result<()> {
-    #[cfg(not(miri))]
-    let data_prefix = NamedTempFile::new()?;
-    #[cfg(not(miri))]
-    let data_prefix = data_prefix.path();
-    #[cfg(miri)]
-    let data_prefix = std::path::Path::new("/");
+    let guard = TempFileGuard::new();
 
     #[cfg(not(miri))]
     let trie_file = NamedTempFile::new()?;
@@ -326,7 +349,7 @@ fn test_file_bypass() -> eyre::Result<()> {
         #[cfg(miri)]
         let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
-        let mut logger = CapLog::<8>::new_storage(8, trie_storage, data_prefix, 10, false)?;
+        let mut logger = CapLog::<8>::new_storage(8, trie_storage, &guard.prefix, 10, false)?;
 
         // log request
         let mut payload = capnp::message::Builder::new_default();
@@ -334,7 +357,6 @@ fn test_file_bypass() -> eyre::Result<()> {
         gen_anypointer_message(0, anypointer);
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
-        println!("append finish");
 
         if let Ok(_) = result.try_recv() {
             assert!(false, "Promise shouldn't be ready yet!");
