@@ -1,6 +1,6 @@
 use std::cmp::min;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, Write};
 use std::mem::MaybeUninit;
 
 pub trait OffsetRead {
@@ -252,5 +252,34 @@ impl<'a, R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'a
     #[inline]
     fn consume(&mut self, amt: usize) {
         self.pos = std::cmp::min(self.pos + amt, self.filled);
+    }
+}
+
+impl<'a, R: OffsetRead, const SIZE: usize> Seek for &'_ mut ReadSessionBuf<'a, R, SIZE> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let n = match pos {
+            io::SeekFrom::Start(n) => n as i64,
+            io::SeekFrom::Current(n) => self.offset as i64 + n,
+            io::SeekFrom::End(n) => {
+                return Err(io::Error::new(
+                    ErrorKind::Unsupported,
+                    "Can't seek to end of file in a session",
+                ));
+            }
+        };
+
+        if n.is_negative() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "tried to seek before start of file",
+            ));
+        }
+
+        self.offset = n as u64;
+        Ok(self.offset)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.offset)
     }
 }
