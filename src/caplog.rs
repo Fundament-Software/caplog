@@ -235,7 +235,7 @@ impl FileManagement {
         None
     }
 
-    //#[cfg(not(miri))]
+    #[cfg(not(miri))]
     pub fn find_latest_file(&self) -> Option<u128> {
         let pattern = self.prefix.file_name()?.to_str()?;
         let mut highest = None; // 0 is a valid return value here, so this must be a proper Option
@@ -368,7 +368,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             nesting_limit: 128,
         };
 
-        //#[cfg(not(miri))]
+        #[cfg(not(miri))]
         let (mut file, id) = if let Some(id) = archive.find_latest_file() {
             let data_path = archive.get_path(id);
             if let Ok(mut file) = OpenOptions::new().read(true).write(true).create(false).open(data_path) {
