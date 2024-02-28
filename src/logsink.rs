@@ -375,3 +375,91 @@ fn test_file_bypass() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn test_file_reload() -> Result<()> {
+    let guard = TempFileGuard::new();
+    let trie_file = NamedTempFile::new()?.into_temp_path();
+    {
+        let trie_storage = HashedArrayStorage::new(&trie_file, 2_u64.pow(16))?;
+        let mut logger =
+            CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
+
+        // log request
+        let mut payload = capnp::message::Builder::new_default();
+        let anypointer = payload.init_root::<any_pointer::Builder>();
+        gen_anypointer_message(0, anypointer);
+
+        let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
+
+        if let Ok(_) = result.try_recv() {
+            assert!(false, "Promise shouldn't be ready yet!");
+        }
+        logger.flush()?;
+        logger.process_pending();
+        let _ = result.recv()?;
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut root = message.init_root();
+
+        logger.get_log(2, 3, false, &mut root)?;
+
+        check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
+    }
+
+    {
+        let trie_storage = HashedArrayStorage::load(&trie_file)?;
+        let mut logger =
+            CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut root = message.init_root();
+
+        logger.get_log(2, 3, false, &mut root)?;
+
+        check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn test_file_integrity() -> Result<()> {
+    let guard = TempFileGuard::new();
+    let trie_file = NamedTempFile::new()?;
+    {
+        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let mut set = capnp_rpc::CapabilityServerSet::new();
+        let client: log_sink::Client = set.new_client(CapLog::<128>::new_storage(
+            crate::caplog::MAX_FILE_SIZE,
+            trie_storage,
+            &guard.prefix,
+            10,
+            false,
+        )?);
+
+        for i in 0..0x7F {
+            // log request
+            let mut request = client.log_request();
+            gen_request(i, request.get());
+            let mut result = request.send().promise;
+            if let Poll::Ready(_) = futures::poll!(&mut result) {
+                assert!(false, "Promise shouldn't be ready yet!");
+            }
+            let hook = set.get_local_server(&client).await.unwrap();
+            let mut logger = hook.borrow_mut();
+            logger.flush()?;
+            logger.process_pending();
+            result.await?;
+        }
+    }
+
+    {
+        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let _ = CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
+    }
+
+    Ok(())
+}
