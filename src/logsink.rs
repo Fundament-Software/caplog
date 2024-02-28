@@ -408,6 +408,7 @@ async fn test_file_reload() -> Result<()> {
         check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
     }
 
+    #[cfg(not(miri))]
     {
         let trie_storage = HashedArrayStorage::load(&trie_file)?;
         let mut logger =
