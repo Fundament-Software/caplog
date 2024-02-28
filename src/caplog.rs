@@ -17,7 +17,7 @@ use crate::fakefile::FakeFile;
 use std::collections::VecDeque;
 #[cfg(not(miri))]
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
@@ -122,7 +122,7 @@ impl FileManagement {
         // we rely on ensuring that it gets put into our archive and then cloning the archival copy, and setting
         // the position to the end.
         let mut file = self.get_data_file(id)?;
-        file.seek(std::io::SeekFrom::End(0)).ok()?;
+        file.seek(SeekFrom::End(0)).ok()?;
         Some(file)
     }
 
@@ -181,7 +181,7 @@ impl FileManagement {
 
         header.write_at(&mut file, 0)?;
         file.flush()?;
-        file.seek(std::io::SeekFrom::End(0))?;
+        file.seek(SeekFrom::End(0))?;
         Ok(file)
     }
 
@@ -235,14 +235,14 @@ impl FileManagement {
         None
     }
 
-    #[cfg(not(miri))]
+    //#[cfg(not(miri))]
     pub fn find_latest_file(&self) -> Option<u128> {
         let pattern = self.prefix.file_name()?.to_str()?;
         let mut highest = None; // 0 is a valid return value here, so this must be a proper Option
 
         for entry in std::fs::read_dir(self.prefix.parent()?).ok()? {
             if let Some(x) = Self::check_entry(pattern, entry) {
-                highest = highest.map(|h| std::cmp::max(h, x))
+                highest = highest.map_or(Some(x), |h| Some(std::cmp::max(h, x)));
             }
         }
 
@@ -363,8 +363,12 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             max_open_files,
             files: RwLock::new(SortedMap::new()),
         };
+        let options = ReaderOptions {
+            traversal_limit_in_words: None,
+            nesting_limit: 128,
+        };
 
-        #[cfg(not(miri))]
+        //#[cfg(not(miri))]
         let (mut file, id) = if let Some(id) = archive.find_latest_file() {
             let data_path = archive.get_path(id);
             if let Ok(mut file) = OpenOptions::new().read(true).write(true).create(false).open(data_path) {
@@ -376,15 +380,32 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
                 }
 
                 if check_consistency {
-                    // TODO: Go through file and check all the hashes
+                    file.seek(SeekFrom::End(0))?;
+                    let end = file.stream_position()?;
+                    let mut session: ReadSessionBuf<'_, FileType, 4096> =
+                        ReadSessionBuf::new(&file, headerstartbuf.len() as u64);
 
-                    // We can assume that the data is a struct of some kind
-                    //let value_reader: capnp::dynamic_value::Reader<'_> = payload.into();
-                    //let struct_reader = value_reader.downcast::<dynamic_struct::Reader<'_>>();
-                    //let payload_size = struct_reader.total_size()?;
+                    while (&mut session).stream_position()? < end {
+                        let reader = capnp::serialize_packed::read_message(&mut session, options)?;
+                        let segments = reader.into_segments();
+                        let bytes: &[u8] = &segments;
+                        let words = unsafe {
+                            std::slice::from_raw_parts(bytes.as_ptr() as *const u64, bytes.len() / size_of::<u64>())
+                        };
+
+                        let hash = murmur3_aligned(words, 0);
+
+                        let mut buf = [0_u8; size_of::<u128>()];
+                        (&mut session).read_exact(&mut buf)?;
+                        let expected = u128::from_le_bytes(buf);
+
+                        if hash != expected {
+                            return Err(CapLogError::CorruptData(hash, expected).into());
+                        }
+                    }
                 }
 
-                file.seek(std::io::SeekFrom::End(0))?;
+                file.seek(SeekFrom::End(0))?;
 
                 (file, id)
             } else {
@@ -413,10 +434,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             last_flush: 0,
             current_id: id,
             archive,
-            options: ReaderOptions {
-                traversal_limit_in_words: None,
-                nesting_limit: 128,
-            },
+            options,
             pending: VecDeque::new(),
         };
 
@@ -493,14 +511,12 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         Ok(())
     }
 
-    fn reset(&mut self, id: u128) -> Result<()> {
-        // We open a new file handle first so that we can swap it into the ring buffer if necessary
-        let mut file = self.archive.new_file(id)?;
-
-        if let Ok(mut files) = self.archive.files.write() {
-            files.insert(id, file.try_clone().ok());
-        }
-
+    fn finalize<'a>(
+        &'a mut self,
+    ) -> Result<(
+        std::sync::MutexGuard<'a, crate::ring_buf_writer::RingBufFlusher<FileType>>,
+        &'a crate::ring_buf_writer::RingBufState,
+    )> {
         if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
             // Dump current buffer
             flusher.flush_buf::<BUFFER_SIZE>(state)?;
@@ -518,11 +534,26 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
                 return Err(e.into());
             }
 
+            self.trie.storage.borrow_mut().flush()?;
+
+            Ok((flusher, state))
+        } else {
+            Err(CapLogError::FileError.into())
+        }
+    }
+
+    fn reset(&mut self, id: u128) -> Result<()> {
+        // We open a new file handle first so that we can swap it into the ring buffer if necessary
+        let mut file = self.archive.new_file(id)?;
+
+        if let Ok(mut files) = self.archive.files.write() {
+            files.insert(id, file.try_clone().ok());
+        }
+
+        if let Ok((mut flusher, state)) = self.finalize() {
             let position = file.stream_position()?;
             // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
             flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position as u64)?;
-
-            self.trie.storage.borrow_mut().flush()?;
         } else {
             return Err(CapLogError::Unknown.into());
         }
@@ -645,8 +676,6 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 impl<const BUFFER_SIZE: usize> Drop for CapLog<BUFFER_SIZE> {
     fn drop(&mut self) {
         self.process_pending();
-        let _ = self.trie.storage.borrow_mut().flush();
-        let handle = &mut self.data_file.as_ref();
-        let _ = handle.flush();
+        let _ = self.finalize();
     }
 }
