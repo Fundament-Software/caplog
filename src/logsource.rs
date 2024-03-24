@@ -7,9 +7,10 @@ use capnp_macros::capnproto_rpc;
 impl<const BUFFER_SIZE: usize> log_source::Server for CapLog<BUFFER_SIZE> {
     fn get(&mut self, snowflake_id: u64, machine_id: u64, schema: u64, verify: bool) {
         let _ = schema;
+
         match self.get_log(snowflake_id, machine_id, verify, &mut results.get().init_payload()) {
-            Ok(()) => Promise::ok(()),
-            Err(e) => Promise::err(capnp::Error::failed(e.to_string())),
+            Ok(_) => capnp::ok(),
+            Err(e) => Err(capnp::Error::failed(e.to_string())),
         }
     }
 }
