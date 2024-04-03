@@ -260,7 +260,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> Seek for &'_ mut ReadSessionBuf<'a, R
         let n = match pos {
             io::SeekFrom::Start(n) => n as i64,
             io::SeekFrom::Current(n) => self.offset as i64 + n,
-            io::SeekFrom::End(n) => {
+            io::SeekFrom::End(_) => {
                 return Err(io::Error::new(
                     ErrorKind::Unsupported,
                     "Can't seek to end of file in a session",

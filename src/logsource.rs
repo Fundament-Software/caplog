@@ -1,6 +1,5 @@
 use super::caplog::CapLog;
 use super::log_capnp::log_source;
-use capnp::capability::Promise;
 use capnp_macros::capnproto_rpc;
 
 #[capnproto_rpc(log_source)]

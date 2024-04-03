@@ -2,7 +2,6 @@ use super::caplog::{CapLog, MAX_BUFFER_SIZE};
 use super::log_capnp::log_sink;
 #[cfg(not(miri))]
 use crate::log_capnp::log_source::Server;
-use capnp::capability::Promise;
 #[cfg(not(miri))]
 use capnp::message::ReaderSegments;
 use capnp::{any_pointer, data};
@@ -30,14 +29,7 @@ impl Future for LogFuture {
 
 #[capnproto_rpc(log_sink)]
 impl<const BUFFER_SIZE: usize> log_sink::Server for CapLog<BUFFER_SIZE> {
-    fn log(
-        &mut self,
-        snowflake_id: u64,
-        machine_id: u64,
-        instance_id: u64,
-        schema: u64,
-        payload: ::capnp::data::Reader,
-    ) {
+    fn log(&mut self, snowflake_id: u64, machine_id: u64, instance_id: u64, schema: u64, payload: data::Reader) {
         let _ = schema;
         const EXTRA_WORDS: usize = 4;
         let size = rparams.total_size()?;
@@ -105,7 +97,7 @@ impl Drop for TempFileGuard {
 }
 
 #[cfg(test)]
-fn gen_anypointer_message<'a>(index: u64, anypointer: ::capnp::any_pointer::Builder<'a>) -> log_entry::Builder<'a> {
+fn gen_anypointer_message<'a>(index: u64, anypointer: any_pointer::Builder<'a>) -> log_entry::Builder<'a> {
     let mut builder = anypointer.init_as::<log_entry::Builder>();
     builder.set_snowflake_id(index * 10 + 5);
     builder.set_machine_id(index * 10 + 6);
