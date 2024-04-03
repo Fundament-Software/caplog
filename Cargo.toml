@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-capnp = { git = "https://github.com/Fundament-Software/capnproto-rust" }
-capnp-futures = { git = "https://github.com/Fundament-Software/capnproto-rust" }
-capnp-import = { git = "https://github.com/Fundament-Software/capnproto-rust" }
-capnp-rpc = { git = "https://github.com/Fundament-Software/capnproto-rust" }
-capnp-macros = { git = "https://github.com/Fundament-Software/capnproto-rust" }
+capstone = { git = "https://github.com/Fundament-Software/capstone-rs" }
+capstone-futures = { git = "https://github.com/Fundament-Software/capstone-rs" }
+capstone-import = { git = "https://github.com/Fundament-Software/capstone-rs" }
+capstone-rpc = { git = "https://github.com/Fundament-Software/capstone-rs" }
+capstone-macros = { git = "https://github.com/Fundament-Software/capstone-rs" }
 color-eyre = "0.6"
 eyre = "0.6"
 tokio = { version = "1.18", features = ["full"] }
