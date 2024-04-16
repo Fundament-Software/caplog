@@ -7,6 +7,7 @@ use capnp::message::ReaderSegments;
 use capnp::{any_pointer, data};
 use capnp_macros::capnproto_rpc;
 use core::future::Future;
+use std::cell::RefCell;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::mpsc::Receiver;
@@ -28,15 +29,18 @@ impl Future for LogFuture {
 }
 
 #[capnproto_rpc(log_sink)]
-impl<const BUFFER_SIZE: usize> log_sink::Server for CapLog<BUFFER_SIZE> {
-    fn log(&mut self, snowflake_id: u64, machine_id: u64, instance_id: u64, schema: u64, payload: data::Reader) {
+impl<const BUFFER_SIZE: usize> log_sink::Server for RefCell<CapLog<BUFFER_SIZE>> {
+    async fn log(&self, snowflake_id: u64, machine_id: u64, instance_id: u64, schema: u64, payload: data::Reader) {
         let _ = schema;
         const EXTRA_WORDS: usize = 4;
         let size = rparams.total_size()?;
         let words = size.word_count as usize + size.cap_count as usize + EXTRA_WORDS;
 
-        match self.append(snowflake_id, machine_id, instance_id, schema, payload, words) {
-            Ok(receiver) => Ok(LogFuture { receiver }),
+        match self
+            .borrow_mut()
+            .append(snowflake_id, machine_id, instance_id, schema, payload, words)
+        {
+            Ok(receiver) => LogFuture { receiver }.await,
             Err(e) => Err(capnp::Error::failed(e.to_string())),
         }
     }
@@ -131,13 +135,13 @@ async fn test_basic_log() -> Result<()> {
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
-        let client: log_sink::Client = set.new_client(CapLog::<MAX_BUFFER_SIZE>::new_storage(
+        let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<MAX_BUFFER_SIZE>::new_storage(
             65535,
             trie_storage,
             &guard.prefix,
             10,
             false,
-        )?);
+        )?));
 
         // log request
         let mut request = client.log_request();
@@ -170,8 +174,14 @@ async fn test_basic_threading() -> Result<()> {
     let trie_file = NamedTempFile::new()?;
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
-        let logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
-        let flusher = Arc::downgrade(&logger.data_file.clone());
+        let logger = RefCell::new(CapLog::<MAX_BUFFER_SIZE>::new_storage(
+            65535,
+            trie_storage,
+            &guard.prefix,
+            10,
+            false,
+        )?);
+        let flusher = Arc::downgrade(&logger.borrow_mut().data_file.clone());
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client = set.new_client(logger);
 
@@ -257,8 +267,13 @@ async fn test_buffer_loop() -> Result<()> {
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
-        let client: log_sink::Client =
-            set.new_client(CapLog::<128>::new_storage(512, trie_storage, &guard.prefix, 10, false)?);
+        let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<128>::new_storage(
+            512,
+            trie_storage,
+            &guard.prefix,
+            10,
+            false,
+        )?));
 
         for i in 0..0xFF {
             // log request
@@ -375,27 +390,34 @@ async fn test_file_reload() -> Result<()> {
     let trie_file = NamedTempFile::new()?.into_temp_path();
     {
         let trie_storage = HashedArrayStorage::new(&trie_file, 2_u64.pow(16))?;
-        let mut logger =
-            CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
+        let mut logger = RefCell::new(CapLog::<128>::new_storage(
+            crate::caplog::MAX_FILE_SIZE,
+            trie_storage,
+            &guard.prefix,
+            10,
+            true,
+        )?);
 
         // log request
         let mut payload = capnp::message::Builder::new_default();
         let anypointer = payload.init_root::<any_pointer::Builder>();
         gen_anypointer_message(0, anypointer);
 
-        let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
+        let result = logger
+            .borrow_mut()
+            .append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
 
         if let Ok(_) = result.try_recv() {
             assert!(false, "Promise shouldn't be ready yet!");
         }
-        logger.flush()?;
-        logger.process_pending();
+        logger.borrow_mut().flush()?;
+        logger.borrow_mut().process_pending();
         let _ = result.recv()?;
 
         let mut message = capnp::message::Builder::new_default();
         let mut root = message.init_root();
 
-        logger.get_log(2, 3, false, &mut root)?;
+        logger.borrow_mut().get_log(2, 3, false, &mut root)?;
 
         check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
     }
@@ -403,13 +425,18 @@ async fn test_file_reload() -> Result<()> {
     #[cfg(not(miri))]
     {
         let trie_storage = HashedArrayStorage::load(&trie_file)?;
-        let mut logger =
-            CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
+        let mut logger = RefCell::new(CapLog::<128>::new_storage(
+            crate::caplog::MAX_FILE_SIZE,
+            trie_storage,
+            &guard.prefix,
+            10,
+            true,
+        )?);
 
         let mut message = capnp::message::Builder::new_default();
         let mut root = message.init_root();
 
-        logger.get_log(2, 3, false, &mut root)?;
+        logger.borrow_mut().get_log(2, 3, false, &mut root)?;
 
         check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
     }
@@ -425,13 +452,13 @@ async fn test_file_integrity() -> Result<()> {
     {
         let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
-        let client: log_sink::Client = set.new_client(CapLog::<128>::new_storage(
+        let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
             trie_storage,
             &guard.prefix,
             10,
             false,
-        )?);
+        )?));
 
         for i in 0..0x7F {
             // log request
