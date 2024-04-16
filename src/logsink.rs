@@ -36,13 +36,15 @@ impl<const BUFFER_SIZE: usize> log_sink::Server for RefCell<CapLog<BUFFER_SIZE>>
         let size = rparams.total_size()?;
         let words = size.word_count as usize + size.cap_count as usize + EXTRA_WORDS;
 
-        match self
+        let receiver = match self
             .borrow_mut()
             .append(snowflake_id, machine_id, instance_id, schema, payload, words)
         {
-            Ok(receiver) => LogFuture { receiver }.await,
-            Err(e) => Err(capnp::Error::failed(e.to_string())),
-        }
+            Ok(receiver) => receiver,
+            Err(e) => return Err(capnp::Error::failed(e.to_string())),
+        };
+
+        LogFuture { receiver }.await
     }
 }
 
