@@ -1,4 +1,10 @@
 mod caplog;
+pub use crate::caplog::CapLog;
+pub use crate::caplog::CapLogError;
+pub use crate::caplog::MAX_BUFFER_SIZE;
+pub use crate::caplog::MAX_FILE_SIZE;
+pub use crate::caplog::MAX_OPEN_FILES;
+
 mod logsink;
 mod logsource;
 pub mod murmur3;
@@ -6,7 +12,7 @@ mod offset_io;
 mod ring_buf_writer;
 pub mod sorted_map;
 use bitfield_struct::bitfield;
-mod hashed_array_trie;
+pub mod hashed_array_trie;
 capnp_import::capnp_import!("log.capnp");
 #[cfg(miri)]
 mod fakefile;
