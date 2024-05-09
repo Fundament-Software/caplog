@@ -392,7 +392,7 @@ async fn test_file_reload() -> Result<()> {
     let trie_file = NamedTempFile::new()?.into_temp_path();
     {
         let trie_storage = HashedArrayStorage::new(&trie_file, 2_u64.pow(16))?;
-        let mut logger = RefCell::new(CapLog::<128>::new_storage(
+        let logger = RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
             trie_storage,
             &guard.prefix,
@@ -427,7 +427,7 @@ async fn test_file_reload() -> Result<()> {
     #[cfg(not(miri))]
     {
         let trie_storage = HashedArrayStorage::load(&trie_file)?;
-        let mut logger = RefCell::new(CapLog::<128>::new_storage(
+        let logger = RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
             trie_storage,
             &guard.prefix,
