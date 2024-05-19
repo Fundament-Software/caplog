@@ -336,7 +336,11 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         check_consistency: bool,
     ) -> Result<Self> {
         let trie_storage = if let Ok(file) = OpenOptions::new().read(true).write(true).create(false).open(trie_file) {
-            HashedArrayStorage::load_file(file)?
+            if trie_file.metadata()?.len() == 0 {
+                HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
+            } else {
+                HashedArrayStorage::load_file(file)?
+            }
         } else {
             HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
         };
