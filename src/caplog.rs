@@ -177,6 +177,7 @@ impl FileManagement {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(self.get_path(id).as_path())?;
 
         header.write_at(&mut file, 0)?;
@@ -191,7 +192,7 @@ impl FileManagement {
         let s = name.as_os_str().to_str()?;
         if s.starts_with(pattern) {
             let (_, n) = s.split_once('_')?;
-            u128::from_str_radix(n, 10).ok() // this isn't radix 16 because we only have base 10 to_string
+            n.parse::<u128>().ok() // this isn't radix 16 because we only have base 10 to_string
         } else {
             None
         }
@@ -515,11 +516,11 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         Ok(())
     }
 
-    fn finalize<'a>(
-        &'a mut self,
+    fn finalize(
+        &mut self,
     ) -> Result<(
-        std::sync::MutexGuard<'a, crate::ring_buf_writer::RingBufFlusher<FileType>>,
-        &'a crate::ring_buf_writer::RingBufState,
+        std::sync::MutexGuard<'_, crate::ring_buf_writer::RingBufFlusher<FileType>>,
+        &crate::ring_buf_writer::RingBufState,
     )> {
         if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
             // Dump current buffer
@@ -557,7 +558,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         if let Ok((mut flusher, state)) = self.finalize() {
             let position = file.stream_position()?;
             // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
-            flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position as u64)?;
+            flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position)?;
         } else {
             return Err(CapLogError::Unknown.into());
         }

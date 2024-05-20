@@ -199,43 +199,43 @@ fn test_parity() {
     let mut a = HashedArrayTrieFlags::new().with_refcount(0);
 
     assert_eq!(a.0, 0);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     assert_eq!(a.calc_parity(), 0);
-    assert_eq!(a.check_parity(), true);
+    assert!(a.check_parity());
     a.set_parity();
     assert_eq!(a.0, 0);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     assert_eq!(a.calc_parity(), 0);
-    assert_eq!(a.check_parity(), true);
+    assert!(a.check_parity());
 
     a.set_refcount(1);
     assert_ne!(a.0, 0);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     assert_eq!(a.calc_parity(), 1);
-    assert_eq!(a.check_parity(), false);
+    assert!(!a.check_parity());
     a.set_parity();
-    assert_eq!(a.get_parity(), true);
+    assert!(a.get_parity());
     assert_eq!(a.calc_parity(), 1);
-    assert_eq!(a.check_parity(), true);
+    assert!(a.check_parity());
 
     a.0 = 0;
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     a.set_skips(1);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     a.set_skips(4);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     a.set_skips(5);
-    assert_eq!(a.get_parity(), true);
+    assert!(a.get_parity());
     a.set_skips(6);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     a.set_skips(7);
-    assert_eq!(a.get_parity(), true);
+    assert!(a.get_parity());
     a.set_skips(1);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
     a.set_skipbits(1 << 19);
-    assert_eq!(a.get_parity(), true);
+    assert!(a.get_parity());
     a.set_skipbits(1 << 18);
-    assert_eq!(a.get_parity(), false);
+    assert!(!a.get_parity());
 }
 
 #[derive(Debug)]
@@ -343,7 +343,7 @@ impl HashedArrayStorage {
         }
 
         let mut result = HashedArrayStorage {
-            handle: handle,
+            handle,
             mapping: Some(mapping),
             //dirty_pages: HashSet::new(),
         };
@@ -1212,8 +1212,6 @@ impl Drop for HashedArrayStorage {
 use rand::seq::SliceRandom;
 #[cfg(test)]
 use rand::thread_rng;
-#[cfg(test)]
-use rand::SeedableRng;
 #[cfg(not(miri))]
 #[cfg(test)]
 use tempfile::tempfile;
