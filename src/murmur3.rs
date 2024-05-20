@@ -86,6 +86,8 @@ fn fmix64(k: u64) -> u64 {
 }
 
 #[cfg(test)]
+use std::fmt::Write;
+#[cfg(test)]
 use std::io::Cursor;
 
 #[cfg(test)]
@@ -93,7 +95,7 @@ mod test {
     use super::*;
     use rand::{Rng, RngCore};
 
-    static SOURCE: &'static [u8; 40] = b"The quick brown fox jumps over the lazy ";
+    static SOURCE: &[u8; 40] = b"The quick brown fox jumps over the lazy ";
 
     #[test]
     fn test_agreement_basic() {
@@ -158,7 +160,10 @@ mod test {
                 "Failed after {} iterations. salt={} data={}",
                 i,
                 salt,
-                buf.iter().map(|b| format!("{:x}", b)).collect::<String>(),
+                buf.iter().fold(String::new(), |mut s, b| {
+                    write!(s, "{:x}", b).unwrap();
+                    s
+                }),
             );
         }
     }

@@ -120,13 +120,13 @@ impl<K: Ord, V> SortedMap<K, V> {
 
     /// Iterate over the keys, sorted
     #[inline]
-    pub fn keys(&self) -> impl Iterator<Item = &K> + ExactSizeIterator + DoubleEndedIterator {
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &K> + DoubleEndedIterator {
         self.data.iter().map(|(k, _)| k)
     }
 
     /// Iterate over values, sorted by key
     #[inline]
-    pub fn values(&self) -> impl Iterator<Item = &V> + ExactSizeIterator + DoubleEndedIterator {
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &V> + DoubleEndedIterator {
         self.data.iter().map(|(_, v)| v)
     }
 
@@ -192,7 +192,7 @@ impl<K: Ord, V> SortedMap<K, V> {
                 if index == self.data.len() || elements.last().unwrap().0 < self.data[index].0 {
                     // We can copy the whole range without having to mix with
                     // existing elements.
-                    self.data.splice(index..index, elements.into_iter());
+                    self.data.splice(index..index, elements);
                     return;
                 }
 

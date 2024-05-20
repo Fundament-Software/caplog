@@ -1,14 +1,11 @@
 use super::caplog::{CapLog, MAX_BUFFER_SIZE};
 use super::log_capnp::log_sink;
 #[cfg(not(miri))]
-use crate::log_capnp::log_source::Server;
-#[cfg(not(miri))]
 use capnp::message::ReaderSegments;
 use capnp::{any_pointer, data};
 use capnp_macros::capnproto_rpc;
 use core::future::Future;
 use std::cell::RefCell;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
@@ -93,17 +90,15 @@ impl TempFileGuard {
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if let Ok(files) = CapLog::<128>::get_all_files(&self.prefix) {
-            for file in files {
-                if let Ok(f) = file {
-                    let _ = std::fs::remove_file(f.path());
-                }
+            for file in files.flatten() {
+                let _ = std::fs::remove_file(file.path());
             }
         }
     }
 }
 
 #[cfg(test)]
-fn gen_anypointer_message<'a>(index: u64, anypointer: any_pointer::Builder<'a>) -> log_entry::Builder<'a> {
+fn gen_anypointer_message(index: u64, anypointer: any_pointer::Builder<'_>) -> log_entry::Builder<'_> {
     let mut builder = anypointer.init_as::<log_entry::Builder>();
     builder.set_snowflake_id(index * 10 + 5);
     builder.set_machine_id(index * 10 + 6);
@@ -113,7 +108,7 @@ fn gen_anypointer_message<'a>(index: u64, anypointer: any_pointer::Builder<'a>) 
 }
 
 #[cfg(test)]
-fn gen_request<'a>(index: u64, mut request: log_sink::log_params::Builder<'a>) {
+fn gen_request(index: u64, mut request: log_sink::log_params::Builder<'_>) {
     request.set_snowflake_id(index * 10 + 2);
     request.set_machine_id(index * 10 + 3);
     request.set_instance_id(index * 10 + 4);
@@ -153,15 +148,17 @@ async fn test_basic_log() -> Result<()> {
             assert!(false, "Promise shouldn't be ready yet!");
         }
         let hook = set.get_local_server(&client).await.unwrap();
-        let mut logger = hook.borrow_mut();
-        logger.flush()?;
-        logger.process_pending();
+        {
+            let mut logger = hook.borrow_mut();
+            logger.flush()?;
+            logger.process_pending();
+        }
         result.await?;
 
         let mut message = capnp::message::Builder::new_default();
         let mut root = message.init_root();
 
-        logger.get_log(2, 3, true, &mut root)?;
+        hook.borrow_mut().get_log(2, 3, true, &mut root)?;
 
         check_payload(0, root.into_reader().get_as::<log_entry::Reader>()?);
     }
@@ -243,7 +240,7 @@ fn test_basic_miri() -> eyre::Result<()> {
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
 
-        if let Ok(_) = result.try_recv() {
+        if result.try_recv().is_ok() {
             assert!(false, "Promise shouldn't be ready yet!");
         }
         logger.flush()?;
@@ -327,7 +324,7 @@ fn test_buffer_bypass() -> eyre::Result<()> {
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
 
-        if let Ok(_) = result.try_recv() {
+        if result.try_recv().is_ok() {
             assert!(false, "Promise shouldn't be ready yet!");
         }
         logger.flush()?;
@@ -367,7 +364,7 @@ fn test_file_bypass() -> eyre::Result<()> {
 
         let result = logger.append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
 
-        if let Ok(_) = result.try_recv() {
+        if result.try_recv().is_ok() {
             assert!(false, "Promise shouldn't be ready yet!");
         }
         logger.flush()?;
@@ -409,7 +406,7 @@ async fn test_file_reload() -> Result<()> {
             .borrow_mut()
             .append(2, 3, 4, 0, payload.get_root_as_reader()?, 10)?;
 
-        if let Ok(_) = result.try_recv() {
+        if result.try_recv().is_ok() {
             assert!(false, "Promise shouldn't be ready yet!");
         }
         logger.borrow_mut().flush()?;
