@@ -1,8 +1,9 @@
-use super::caplog::{CapLog, MAX_BUFFER_SIZE};
+use super::caplog::CapLog;
+#[cfg(test)]
+use super::caplog::MAX_BUFFER_SIZE;
 use super::log_capnp::log_sink;
-#[cfg(not(miri))]
-use capnp::message::ReaderSegments;
-use capnp::{any_pointer, data};
+#[cfg(test)]
+use capnp::any_pointer;
 use capnp_macros::capnproto_rpc;
 use core::future::Future;
 use std::cell::RefCell;
@@ -27,7 +28,14 @@ impl Future for LogFuture {
 
 #[capnproto_rpc(log_sink)]
 impl<const BUFFER_SIZE: usize> log_sink::Server for RefCell<CapLog<BUFFER_SIZE>> {
-    async fn log(&self, snowflake_id: u64, machine_id: u64, instance_id: u64, schema: u64, payload: data::Reader) {
+    async fn log(
+        &self,
+        snowflake_id: u64,
+        machine_id: u64,
+        instance_id: u64,
+        schema: u64,
+        payload: capnp::data::Reader,
+    ) {
         let _ = schema;
         const EXTRA_WORDS: usize = 4;
         let size = rparams.total_size()?;
