@@ -6,7 +6,7 @@ use crate::ring_buf_writer::RingBufWriter;
 use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie, HashedArrayTrieError};
 
 use super::sorted_map::SortedMap;
-use capnp::message::{self, Allocator, ReaderOptions, TypedReader};
+use capnp::message::{self, ReaderOptions, TypedReader};
 use eyre::eyre;
 use eyre::Result;
 use std::alloc;
@@ -28,6 +28,10 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use thiserror::Error;
 
+#[cfg(test)]
+use capnp::message::Allocator;
+
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum CapLogError {
     #[error("value {v:?} is out of bounds: [{minimum:?}-{maximum:?}]")]
@@ -91,6 +95,7 @@ impl HeaderStart {
 /// Maximum size of a data file. When this is reached, both the header file and data file are finalized,
 /// the in-memory vectors cleared, and a new data and header file are created
 pub const MAX_FILE_SIZE: u64 = 2_u64.pow(28);
+#[allow(dead_code)]
 pub const MAX_OPEN_FILES: usize = 10;
 #[cfg(not(miri))]
 pub const MAX_BUFFER_SIZE: usize = 2_usize.pow(22);
@@ -102,6 +107,7 @@ type FileType = File;
 #[cfg(miri)]
 type FileType = FakeFile;
 
+#[allow(dead_code)]
 struct FileManagement {
     max_open_files: usize,
     files: RwLock<SortedMap<u128, Option<FileType>>>,

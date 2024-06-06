@@ -80,7 +80,6 @@ impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
     /// Flush all data up to the commit marker into our writer. We ignore any data that
     /// hasn't been committed to, because we allow writers to manipulate data they've
     /// written but not committed.
-    #[must_use]
     pub fn flush_buf<const SIZE: usize>(&mut self, state: &RingBufState) -> Result<()> {
         let mut start = state.start.load(Ordering::Acquire);
         let mut position = state.write_head.load(Ordering::Acquire);
@@ -121,6 +120,7 @@ impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
     }
 }
 
+#[allow(dead_code)]
 impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     pub fn flush_position(&self) -> u64 {
         self.state.flush_head.load(Ordering::Relaxed)
@@ -271,6 +271,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
         self.state.marker.store(end % SIZE, Ordering::Release);
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn lock_flusher(
         &self,
     ) -> std::result::Result<
