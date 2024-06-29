@@ -24,10 +24,8 @@ const MAX_NODE_BYTES: usize = size_of::<[u64; MAX_NODE_SIZE]>();
 const PAGE_SIZE: usize = 4096;
 const FLUSH_THRESHOLD: usize = 2048;
 
-use thiserror::Error;
-
-#[derive(Error, Debug, PartialEq)]
-pub enum HashedArrayTrieError {
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum Error {
     #[error("Expected memory mapped size of at least {0} but found {1}")]
     MemMapTooSmall(usize, usize),
     #[error("Memory alignment should be aligned to {0} but is off by {1}")]
@@ -49,7 +47,7 @@ pub enum HashedArrayTrieError {
 }
 
 #[bitfield(u64)]
-struct HashedArrayTrieFlags {
+struct Flags {
     #[bits(32)]
     mask: u32, // Each bit represents a child that exists, and the total number of children is the number of set bits
     #[bits(1)]
@@ -62,7 +60,7 @@ struct HashedArrayTrieFlags {
     skipbits: u32, // stores the skipped bits of the key
 }
 
-impl HashedArrayTrieFlags {
+impl Flags {
     pub fn offset(&self, index: u8) -> usize {
         (((self.0 & 0xFFFFFFFF) << (32 - index)) as u32).count_ones() as usize
     }
@@ -76,11 +74,11 @@ impl HashedArrayTrieFlags {
         assert!(!self.exists(index));
         self.set_mask(self.mask() | (0b1 << index));
     }
-    pub fn from_ref_mut(target: &mut u64) -> &mut HashedArrayTrieFlags {
-        unsafe { &mut *(target as *mut u64).cast::<HashedArrayTrieFlags>() }
+    pub fn from_ref_mut(target: &mut u64) -> &mut Flags {
+        unsafe { &mut *(target as *mut u64).cast::<Flags>() }
     }
-    pub fn from_ref(target: &u64) -> &HashedArrayTrieFlags {
-        unsafe { &*(target as *const u64).cast::<HashedArrayTrieFlags>() }
+    pub fn from_ref(target: &u64) -> &Flags {
+        unsafe { &*(target as *const u64).cast::<Flags>() }
     }
 
     #[inline]
@@ -128,7 +126,7 @@ impl HashedArrayTrieFlags {
 
 #[test]
 fn test_offsets() {
-    let mut a = HashedArrayTrieFlags::new().with_refcount(1);
+    let mut a = Flags::new().with_refcount(1);
 
     assert_eq!(a.count(), 0);
     assert!(!a.exists(0));
@@ -196,7 +194,7 @@ fn test_offsets() {
 
 #[test]
 fn test_parity() {
-    let mut a = HashedArrayTrieFlags::new().with_refcount(0);
+    let mut a = Flags::new().with_refcount(0);
 
     assert_eq!(a.0, 0);
     assert!(!a.get_parity());
@@ -240,14 +238,14 @@ fn test_parity() {
 
 #[derive(Debug)]
 #[repr(C)]
-struct HashedArrayTrieHeader {
+struct Header {
     freelist: [u64; 32], // Maintains a freelist for all 32 non-leaf node sizes
     root: u64,           // This is the primary root
     clean: u64,          // Only a 1 bit value but set to a u64 to ensure alignment
 }
 
 #[derive(Debug)]
-pub struct HashedArrayStorage {
+pub struct Storage {
     handle: Option<File>,
     #[cfg(miri)]
     mapping: Option<Vec<u8>>,
@@ -257,26 +255,26 @@ pub struct HashedArrayStorage {
     //dirty_pages: HashSet<usize>,
 }
 
-const HEADER_BYTES: usize = size_of::<HashedArrayTrieHeader>();
+const HEADER_BYTES: usize = size_of::<Header>();
 
-impl HashedArrayStorage {
+impl Storage {
     #[inline]
-    fn parts(&self) -> (&HashedArrayTrieHeader, &[u64]) {
+    fn parts(&self) -> (&Header, &[u64]) {
         unsafe {
             let (header, slice) = self.mapping.as_ref().unwrap_unchecked().split_at(HEADER_BYTES);
             (
-                &*(header.as_ptr() as *const HashedArrayTrieHeader),
+                &*(header.as_ptr() as *const Header),
                 std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len() / size_of::<u64>()),
             )
         }
     }
 
     #[inline]
-    fn parts_mut(&mut self) -> (&mut HashedArrayTrieHeader, &mut [u64]) {
+    fn parts_mut(&mut self) -> (&mut Header, &mut [u64]) {
         unsafe {
             let (header, slice) = self.mapping.as_mut().unwrap_unchecked().split_at_mut(HEADER_BYTES);
             (
-                &mut *(header.as_mut_ptr() as *mut HashedArrayTrieHeader),
+                &mut *(header.as_mut_ptr() as *mut Header),
                 std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u64, slice.len() / size_of::<u64>()),
             )
         }
@@ -303,15 +301,15 @@ impl HashedArrayStorage {
         let (prefix, slice, tail) = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>();
 
         if !prefix.is_empty() {
-            return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
         } else if !tail.is_empty() {
-            return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), tail.len()).into());
+            return Err(Error::InvalidAlignment(size_of::<u64>(), tail.len()).into());
         }
 
         // Initialize our canary integer at offset 0, which is always invalid.
         slice[0] = u64::MAX;
         // Initialize the root node as empty
-        slice[1] = HashedArrayTrieFlags::new().with_refcount(1).into();
+        slice[1] = Flags::new().with_refcount(1).into();
 
         {
             let (header, _) = self.parts_mut();
@@ -337,12 +335,12 @@ impl HashedArrayStorage {
     }
 
     #[cfg(not(miri))]
-    unsafe fn new_inner(handle: Option<File>, mapping: MmapMut) -> Result<HashedArrayStorage> {
+    unsafe fn new_inner(handle: Option<File>, mapping: MmapMut) -> Result<Storage> {
         if mapping.len() < HEADER_BYTES {
-            return Err(HashedArrayTrieError::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
+            return Err(Error::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
         }
 
-        let mut result = HashedArrayStorage {
+        let mut result = Storage {
             handle,
             mapping: Some(mapping),
             //dirty_pages: HashSet::new(),
@@ -353,7 +351,7 @@ impl HashedArrayStorage {
     }
 
     #[cfg(not(miri))]
-    pub fn new_file(src: File, new_size: u64) -> Result<HashedArrayStorage> {
+    pub fn new_file(src: File, new_size: u64) -> Result<Storage> {
         assert_eq!(
             new_size % size_of::<u64>() as u64,
             0,
@@ -369,7 +367,7 @@ impl HashedArrayStorage {
     }
 
     #[cfg(not(miri))]
-    pub fn new_ref(src: &File, new_size: u64) -> Result<HashedArrayStorage> {
+    pub fn new_ref(src: &File, new_size: u64) -> Result<Storage> {
         assert_eq!(
             new_size % size_of::<u64>() as u64,
             0,
@@ -382,7 +380,7 @@ impl HashedArrayStorage {
     }
 
     #[cfg(not(miri))]
-    pub fn new(path: &Path, new_size: u64) -> Result<HashedArrayStorage> {
+    pub fn new(path: &Path, new_size: u64) -> Result<Storage> {
         let src = OpenOptions::new()
             .read(true)
             .write(true)
@@ -394,7 +392,7 @@ impl HashedArrayStorage {
     }
 
     #[cfg(miri)]
-    pub fn new(_: &Path, new_size: u64) -> Result<HashedArrayStorage> {
+    pub fn new(_: &Path, new_size: u64) -> Result<Storage> {
         unsafe {
             let mut aligned = Vec::<u64>::new();
             aligned.resize(
@@ -409,7 +407,7 @@ impl HashedArrayStorage {
                 aligncap * size_of::<u64>(),
             );
 
-            let mut result = HashedArrayStorage {
+            let mut result = Storage {
                 handle: None,
                 mapping: Some(mapping),
                 //dirty_pages: HashSet::new(),
@@ -453,9 +451,9 @@ impl HashedArrayStorage {
                     return Ok(result);
                 }
             }
-            Err(HashedArrayTrieError::OutOfMemory(self.mapping.as_ref().unwrap().len()).into())
+            Err(Error::OutOfMemory(self.mapping.as_ref().unwrap().len()).into())
         } else {
-            Err(HashedArrayTrieError::OutOfMemory(0).into())
+            Err(Error::OutOfMemory(0).into())
         }
     }
 
@@ -466,12 +464,12 @@ impl HashedArrayStorage {
             unsafe {
                 let ptr = mapping.as_mut_ptr();
                 let unaligned: &mut [u8] = &mut mapping[byte_offset..byte_end];
-                let header = &mut *(ptr as *mut HashedArrayTrieHeader);
+                let header = &mut *(ptr as *mut Header);
                 let (prefix, slice, _) = unaligned.align_to_mut::<u64>();
                 if !prefix.is_empty() {
                     // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which
                     // is very bad.
-                    return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+                    return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
                 }
 
                 // First we get the head and add it to the proper freelist, if there is one
@@ -498,23 +496,23 @@ impl HashedArrayStorage {
             }
             Ok(())
         } else {
-            Err(HashedArrayTrieError::OutOfMemory(0).into())
+            Err(Error::OutOfMemory(0).into())
         }
     }
 
     #[cfg(not(miri))]
-    pub fn load_file(src: File) -> Result<HashedArrayStorage> {
+    pub fn load_file(src: File) -> Result<Storage> {
         let fsize = src.metadata()?.len();
         if fsize < HEADER_BYTES as u64 {
-            return Err(HashedArrayTrieError::FileTooSmall(HEADER_BYTES, fsize).into());
+            return Err(Error::FileTooSmall(HEADER_BYTES, fsize).into());
         }
 
         unsafe {
             let mapping = MmapMut::map_mut(&src)?;
             if mapping.len() < HEADER_BYTES {
-                return Err(HashedArrayTrieError::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
+                return Err(Error::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
             }
-            let mut storage = HashedArrayStorage {
+            let mut storage = Storage {
                 mapping: Some(mapping),
                 handle: Some(src),
                 //dirty_pages: HashSet::new(),
@@ -523,11 +521,11 @@ impl HashedArrayStorage {
             let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
             let prefix = slice.align_to::<u64>().0;
             if !prefix.is_empty() {
-                return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+                return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
             }
             let (header, _) = storage.parts_mut();
             if header.clean == 0 {
-                return Err(HashedArrayTrieError::DirtyTrieState.into());
+                return Err(Error::DirtyTrieState.into());
             }
 
             // Set our clean value to 0 and flush so we can detect if we aren't closed properly
@@ -544,7 +542,7 @@ impl HashedArrayStorage {
 
     #[cfg(not(miri))]
     // Load a file - if it doesn't already exist or is invalid, returns an error
-    pub fn load(path: &Path) -> Result<HashedArrayStorage> {
+    pub fn load(path: &Path) -> Result<Storage> {
         Self::load_file(OpenOptions::new().read(true).write(true).create(false).open(path)?)
     }
 
@@ -556,7 +554,7 @@ impl HashedArrayStorage {
 
         let offset = offset as usize;
         // Ensure this node is consistent.
-        let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+        let node = Flags::from_ref_mut(&mut words[offset]);
 
         if !node.is_valid() {
             return false;
@@ -592,7 +590,7 @@ impl HashedArrayStorage {
 
             assert_eq!(valid_children as u32, mask.count_ones());
 
-            let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+            let node = Flags::from_ref_mut(&mut words[offset]);
             node.set_mask(mask);
             node.set_parity();
 
@@ -610,11 +608,11 @@ impl HashedArrayStorage {
         true
     }
 
-    unsafe fn restore_inner(storage: &mut HashedArrayStorage) -> Result<()> {
+    unsafe fn restore_inner(storage: &mut Storage) -> Result<()> {
         let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
         let prefix = slice.align_to::<u64>().0;
         if !prefix.is_empty() {
-            return Err(HashedArrayTrieError::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
         }
 
         // Clean the header out, setting root to 1 if it's invalid and wiping the freelist.
@@ -656,7 +654,7 @@ impl HashedArrayStorage {
 
     #[cfg(not(miri))]
     // Attempts to reconstruct a file that was not cleanly flushed.
-    pub fn restore_file(src: File) -> Result<HashedArrayStorage> {
+    pub fn restore_file(src: File) -> Result<Storage> {
         // We create a hashmap of all reachable, valid nodes starting from the root. Because all our freelists have at
         // least one 0 following them, no valid node should ever have zero children, and no legitimate offset
         // should ever point at 0, so an invalid section is anything pointing to 0, or pointing to a non-leaf
@@ -664,15 +662,15 @@ impl HashedArrayStorage {
 
         let fsize = src.metadata()?.len();
         if fsize < HEADER_BYTES as u64 {
-            return Err(HashedArrayTrieError::FileTooSmall(HEADER_BYTES, fsize).into());
+            return Err(Error::FileTooSmall(HEADER_BYTES, fsize).into());
         }
 
         unsafe {
             let mapping = MmapMut::map_mut(&src)?;
             if mapping.len() < HEADER_BYTES {
-                return Err(HashedArrayTrieError::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
+                return Err(Error::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
             }
-            let mut storage = HashedArrayStorage {
+            let mut storage = Storage {
                 mapping: Some(mapping),
                 handle: Some(src),
                 //dirty_pages: HashSet::new(),
@@ -687,17 +685,17 @@ impl HashedArrayStorage {
     }
 
     #[cfg(not(miri))]
-    pub fn restore(path: &Path) -> Result<HashedArrayStorage> {
+    pub fn restore(path: &Path) -> Result<Storage> {
         Self::restore_file(OpenOptions::new().read(true).write(true).create(false).open(path)?)
     }
 
     #[cfg(miri)]
-    pub fn restore(src: Vec<u8>) -> Result<HashedArrayStorage> {
+    pub fn restore(src: Vec<u8>) -> Result<Storage> {
         unsafe {
             if src.len() < HEADER_BYTES {
-                return Err(HashedArrayTrieError::MemMapTooSmall(HEADER_BYTES, src.len()).into());
+                return Err(Error::MemMapTooSmall(HEADER_BYTES, src.len()).into());
             }
-            let mut storage = HashedArrayStorage {
+            let mut storage = Storage {
                 mapping: Some(src),
                 handle: None,
                 //dirty_pages: HashSet::new(),
@@ -761,7 +759,7 @@ impl HashedArrayStorage {
             return Ok(());
         }
 
-        Err(HashedArrayTrieError::OutOfMemory(0).into())
+        Err(Error::OutOfMemory(0).into())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -784,7 +782,7 @@ impl HashedArrayStorage {
             }
         }
 
-        Err(HashedArrayTrieError::OutOfMemory(0).into())
+        Err(Error::OutOfMemory(0).into())
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -809,7 +807,7 @@ pub struct HashedArrayTrie<K>
 where
     K: num::PrimInt,
 {
-    pub storage: Rc<RefCell<HashedArrayStorage>>,
+    pub storage: Rc<RefCell<Storage>>,
     offset: u64,
     phantomkey: PhantomData<K>,
 }
@@ -818,7 +816,7 @@ impl<K> HashedArrayTrie<K>
 where
     K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
-    pub fn new(storage: &Rc<RefCell<HashedArrayStorage>>, root: u64) -> HashedArrayTrie<K> {
+    pub fn new(storage: &Rc<RefCell<Storage>>, root: u64) -> HashedArrayTrie<K> {
         HashedArrayTrie {
             storage: Rc::clone(storage),
             offset: root,
@@ -839,9 +837,9 @@ where
     // not!
     #[inline]
     fn fix_node_refcount(node: usize, words: &mut [u64]) {
-        let count = HashedArrayTrieFlags::from_ref(&words[node]).count();
+        let count = Flags::from_ref(&words[node]).count();
         for i in (node + 1)..=(node + count) {
-            let flags = HashedArrayTrieFlags::from_ref_mut(&mut words[words[i] as usize]);
+            let flags = Flags::from_ref_mut(&mut words[words[i] as usize]);
             flags.set_refcount(flags.refcount() + 1);
             flags.set_parity();
         }
@@ -852,7 +850,7 @@ where
         words[offset] |= 0b1 << index;
         words[offset + count + 1] = value;
 
-        let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+        let node = Flags::from_ref_mut(&mut words[offset]);
         node.set_parity();
         let indice = node.offset(index);
 
@@ -864,9 +862,9 @@ where
 
     #[inline]
     fn remove(offset: usize, words: &mut [u64], index: u8, count: usize) -> u64 {
-        let indice = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]).offset(index);
+        let indice = Flags::from_ref_mut(&mut words[offset]).offset(index);
         words[offset] &= !(0b1 << index);
-        HashedArrayTrieFlags::from_ref_mut(&mut words[offset]).set_parity();
+        Flags::from_ref_mut(&mut words[offset]).set_parity();
 
         // Do up to N swaps (going forwards) to get the value we removed to the end
         for i in indice..(count - 1) {
@@ -884,7 +882,7 @@ where
         assert_ne!(root, u64::MAX);
         assert_ne!(words[root as usize], 0);
         assert_ne!(words[root as usize], u64::MAX);
-        let flags = HashedArrayTrieFlags::from_ref(&words[root as usize]);
+        let flags = Flags::from_ref(&words[root as usize]);
         if bits > 5 {
             let count = flags.count();
             for i in 1..=count {
@@ -893,16 +891,10 @@ where
         }
     }
 
-    fn delete_checked(
-        offset: usize,
-        bits: usize,
-        header: &mut HashedArrayTrieHeader,
-        words: &mut [u64],
-        recurse: bool,
-    ) -> Result<()> {
+    fn delete_checked(offset: usize, bits: usize, header: &mut Header, words: &mut [u64], recurse: bool) -> Result<()> {
         assert_ne!(words[offset], 0);
         assert_ne!(words[offset], u64::MAX);
-        let node = HashedArrayTrieFlags::from_ref_mut(&mut words[offset]);
+        let node = Flags::from_ref_mut(&mut words[offset]);
 
         if node.refcount() <= 1 {
             let mut count = node.count();
@@ -928,7 +920,7 @@ where
             // This should never happen unless something is corrupted
             assert_ne!(count, 0);
             if count == 0 {
-                return Err(HashedArrayTrieError::DirtyTrieState.into());
+                return Err(Error::DirtyTrieState.into());
             }
 
             // Add it on to the appropriate freelist (0th index has 1 node, so  we use count - 1)
@@ -944,7 +936,7 @@ where
 
     fn insert_checked(
         offset: usize,
-        store: &mut RefMut<'_, HashedArrayStorage>,
+        store: &mut RefMut<'_, Storage>,
         count: usize,
         index: u8,
         value: u64,
@@ -952,7 +944,7 @@ where
     ) -> Result<u64> {
         if count == 32 {
             // This can only happen if the key already exists and somehow a previous check failed
-            return Err(HashedArrayTrieError::AlreadyExists(store.words()[offset + index as usize + 1]).into());
+            return Err(Error::AlreadyExists(store.words()[offset + index as usize + 1]).into());
         }
         // If we are mutable and we have space, we just append the child and return nothing
         if mutable && offset + count + 1 < store.words().len() && store.words()[offset + count + 1] == 0 {
@@ -972,13 +964,13 @@ where
 
     fn insert_node(
         offset: usize,
-        store: &mut RefMut<'_, HashedArrayStorage>,
+        store: &mut RefMut<'_, Storage>,
         bits: usize,
         key: K,
         value: u64,
         mutable: bool,
     ) -> Result<u64> {
-        let node = HashedArrayTrieFlags::from_ref_mut(&mut store.words_mut()[offset]);
+        let node = Flags::from_ref_mut(&mut store.words_mut()[offset]);
         let mutable = mutable && node.refcount() == 1;
         let count = node.count();
         if bits > 5 {
@@ -1012,7 +1004,7 @@ where
                         }
 
                         Self::clone_node(offset, clone, count, words);
-                        let clone_node = HashedArrayTrieFlags::from_ref(&words[clone as usize]);
+                        let clone_node = Flags::from_ref(&words[clone as usize]);
 
                         // Then we point our clone to the new node offset and return it
                         words[clone as usize + clone_node.offset(index) + 1] = n;
@@ -1025,10 +1017,7 @@ where
                 // Create a new child node that is empty and recurse into it. We force it to be mutable, so it shouldn't
                 // return anything.
                 let child = store.allocate(1)?;
-                store.words_mut()[child as usize] = HashedArrayTrieFlags::new()
-                    .with_refcount(1)
-                    .with_leaf(bits <= 10)
-                    .into();
+                store.words_mut()[child as usize] = Flags::new().with_refcount(1).with_leaf(bits <= 10).into();
                 let n = Self::insert_node(child as usize, store, bits - 5, key, value, true)?;
                 assert_eq!(n, 0);
 
@@ -1040,7 +1029,7 @@ where
             if node.exists(index) {
                 let child_offset = node.offset(index);
                 let words = store.words();
-                Err(HashedArrayTrieError::AlreadyExists(words[offset + child_offset + 1]).into())
+                Err(Error::AlreadyExists(words[offset + child_offset + 1]).into())
             } else {
                 Self::insert_checked(offset, store, count, index, value, mutable)
             }
@@ -1054,7 +1043,7 @@ where
         let bits = size_of::<K>() * 8;
         let mutable = {
             let (_, words) = store.parts();
-            let root = HashedArrayTrieFlags::from_ref(&words[offset]);
+            let root = Flags::from_ref(&words[offset]);
             root.refcount() <= 1
         };
 
@@ -1062,7 +1051,7 @@ where
         if n != 0 {
             // We reacquire root here after the call so that Rust doesn't think we require two borrows at the same time
             let (_, words) = store.parts_mut();
-            let root = HashedArrayTrieFlags::from_ref(&words[offset]);
+            let root = Flags::from_ref(&words[offset]);
             if root.refcount() > 1 {
                 Self::fix_node_refcount(n as usize, words);
                 return Ok(Some(HashedArrayTrie {
@@ -1086,12 +1075,12 @@ where
         let words = store.words();
 
         while bits > 5 {
-            let node = HashedArrayTrieFlags::from_ref(&words[offset]);
+            let node = Flags::from_ref(&words[offset]);
             let index: u8 = key.shr(bits - 5).as_() & 0b11111;
 
             // Check if the node is set
             if !node.exists(index) {
-                return Err(HashedArrayTrieError::NotFound {
+                return Err(Error::NotFound {
                     key_offset: bits as u8,
                     key_bits: index,
                     node: offset as u64,
@@ -1103,12 +1092,12 @@ where
             bits -= 5;
         }
 
-        let node = HashedArrayTrieFlags::from_ref(&words[offset]);
+        let node = Flags::from_ref(&words[offset]);
         let index: u8 = key.as_() & (0b11111 >> (5 - bits));
 
         // Check if the node is set
         if !node.exists(index) {
-            return Err(HashedArrayTrieError::NotFound {
+            return Err(Error::NotFound {
                 key_offset: bits as u8,
                 key_bits: index,
                 node: offset as u64,
@@ -1119,14 +1108,14 @@ where
         Ok(words[offset + node.offset(index) + 1])
     }
 
-    fn delete_node(offset: usize, store: &mut RefMut<'_, HashedArrayStorage>, bits: usize, key: K) -> Result<u64> {
-        let node = HashedArrayTrieFlags::from_ref_mut(&mut store.words_mut()[offset]);
+    fn delete_node(offset: usize, store: &mut RefMut<'_, Storage>, bits: usize, key: K) -> Result<u64> {
+        let node = Flags::from_ref_mut(&mut store.words_mut()[offset]);
         if bits > 5 {
             let index: u8 = key.shr(bits - 5).as_() & 0b11111;
 
             // Check if the node is set
             if !node.exists(index) {
-                return Err(HashedArrayTrieError::NotFound {
+                return Err(Error::NotFound {
                     key_offset: bits as u8,
                     key_bits: index,
                     node: offset as u64,
@@ -1139,7 +1128,7 @@ where
             let child = store.words()[child_offset] as usize;
             let value = Self::delete_node(child, store, bits - 5, key)?;
 
-            if HashedArrayTrieFlags::from_ref(&store.words()[child]).count() == 0 {
+            if Flags::from_ref(&store.words()[child]).count() == 0 {
                 let (header, words) = store.parts_mut();
                 let check = Self::remove(offset, words, index, count);
                 assert_eq!(check, child as u64);
@@ -1152,7 +1141,7 @@ where
 
             // Check if the node is set
             if !node.exists(index) {
-                return Err(HashedArrayTrieError::NotFound {
+                return Err(Error::NotFound {
                     key_offset: bits as u8,
                     key_bits: index,
                     node: offset as u64,
@@ -1177,7 +1166,7 @@ where
 }
 
 #[cfg(not(miri))]
-impl Drop for HashedArrayStorage {
+impl Drop for Storage {
     fn drop(&mut self) {
         // Set our clean close bit to 1 and flush.
         let (header, _) = self.parts_mut();
@@ -1188,7 +1177,7 @@ impl Drop for HashedArrayStorage {
 }
 
 #[cfg(miri)]
-impl Drop for HashedArrayStorage {
+impl Drop for Storage {
     fn drop(&mut self) {
         let (header, _) = self.parts_mut();
         header.clean = 1;
@@ -1228,14 +1217,14 @@ where
 #[cfg(not(miri))]
 #[test]
 fn test_storage_new() -> Result<()> {
-    let _ = HashedArrayStorage::new_file(tempfile()?, 64)?;
+    let _ = Storage::new_file(tempfile()?, 64)?;
     Ok(())
 }
 
 #[cfg(miri)]
 #[test]
 fn test_storage_new() -> Result<()> {
-    let _ = HashedArrayStorage::new(Path::new(""), 64)?;
+    let _ = Storage::new(Path::new(""), 64)?;
     Ok(())
 }
 
@@ -1244,30 +1233,27 @@ fn test_out_of_storage() -> Result<()> {
     #[cfg(not(miri))]
     let fileref = tempfile()?;
     #[cfg(not(miri))]
-    let mut store = HashedArrayStorage::new_ref(&fileref, 32)?;
+    let mut store = Storage::new_ref(&fileref, 32)?;
     #[cfg(miri)]
-    let mut store = HashedArrayStorage::new(Path::new(""), 32)?;
+    let mut store = Storage::new(Path::new(""), 32)?;
 
     store.allocate(1)?;
     let e = store.allocate(32).expect_err("Should have run out of memory?!");
-    assert_eq!(
-        e.downcast::<HashedArrayTrieError>().unwrap(),
-        HashedArrayTrieError::OutOfMemory(576)
-    );
+    assert_eq!(e.downcast::<Error>().unwrap(), Error::OutOfMemory(576));
     Ok(())
 }
 
 #[test]
 fn test_storage_allocate() -> Result<()> {
     #[cfg(not(miri))]
-    let mut store = HashedArrayStorage::new_file(tempfile()?, 32)?;
+    let mut store = Storage::new_file(tempfile()?, 32)?;
     #[cfg(miri)]
-    let mut store = HashedArrayStorage::new(Path::new(""), 32)?;
+    let mut store = Storage::new(Path::new(""), 32)?;
 
     for i in 1..=32 {
         while let Err(e) = store.allocate(i) {
-            match e.downcast::<HashedArrayTrieError>().unwrap() {
-                HashedArrayTrieError::OutOfMemory(_) => store.resize(),
+            match e.downcast::<Error>().unwrap() {
+                Error::OutOfMemory(_) => store.resize(),
                 err => Err(err.into()),
             }?;
         }
@@ -1281,17 +1267,17 @@ fn test_storage_load() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let mut store = HashedArrayStorage::new_ref(&fileref, 64)?;
+        let mut store = Storage::new_ref(&fileref, 64)?;
         store.allocate(1)?;
         store.allocate(1)?;
     }
 
     {
-        let mut store = HashedArrayStorage::load_file(fileref)?;
+        let mut store = Storage::load_file(fileref)?;
         for i in 1..=32 {
             while let Err(e) = store.allocate(i) {
-                match e.downcast::<HashedArrayTrieError>().unwrap() {
-                    HashedArrayTrieError::OutOfMemory(_) => store.resize(),
+                match e.downcast::<Error>().unwrap() {
+                    Error::OutOfMemory(_) => store.resize(),
                     err => Err(err.into()),
                 }?;
             }
@@ -1304,9 +1290,9 @@ fn test_storage_load() -> Result<()> {
 #[test]
 fn test_empty() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 32)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 32)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 32)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 32)?));
 
     // We will eventually put a 128-bit FullLogID struct in here
     let _: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
@@ -1316,9 +1302,9 @@ fn test_empty() -> Result<()> {
 #[test]
 fn test_deep_near_miss() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1331,18 +1317,15 @@ fn test_deep_near_miss() -> Result<()> {
 #[test]
 fn test_duplicate() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
 
     let mut trie: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
     assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     let e = trie.insert(1, 2).expect_err("Should have been an error!");
-    assert_eq!(
-        e.downcast::<HashedArrayTrieError>().unwrap(),
-        HashedArrayTrieError::AlreadyExists(1)
-    );
+    assert_eq!(e.downcast::<Error>().unwrap(), Error::AlreadyExists(1));
     assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     Ok(())
 }
@@ -1350,9 +1333,9 @@ fn test_duplicate() -> Result<()> {
 #[test]
 fn test_delete() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
 
     let mut trie: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1360,8 +1343,8 @@ fn test_delete() -> Result<()> {
     assert_eq!(trie.delete(1).expect("Failed to delete key"), 1);
     let e = trie.get(1).expect_err("Should have been an error!");
     assert_eq!(
-        e.downcast::<HashedArrayTrieError>().unwrap(),
-        HashedArrayTrieError::NotFound {
+        e.downcast::<Error>().unwrap(),
+        Error::NotFound {
             key_bits: 0, // This should fail immediately, due to the root being empty
             key_offset: 16,
             node: 1
@@ -1373,9 +1356,9 @@ fn test_delete() -> Result<()> {
 #[test]
 fn test_near_miss() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1024)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1388,9 +1371,9 @@ fn test_near_miss() -> Result<()> {
 #[test]
 fn test_fill_leaf() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1 << 13)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 13)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1 << 13)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 13)?));
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     for i in 0..32 {
@@ -1406,9 +1389,9 @@ fn test_fill_leaf() -> Result<()> {
 #[test]
 fn test_fill_node() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1 << 13)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 13)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1 << 13)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 13)?));
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
@@ -1428,9 +1411,9 @@ fn test_fill_node() -> Result<()> {
 #[test]
 fn test_fill_trie() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 1 << 22)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 22)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 1 << 16)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 16)?));
 
     #[cfg(not(miri))]
     const MAX_COUNT: u16 = u16::MAX;
@@ -1500,9 +1483,9 @@ fn test_fill_trie() -> Result<()> {
 #[test]
 fn test_fill_random() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(tempfile()?, 32)?));
+    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 32)?));
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(HashedArrayStorage::new(Path::new(""), 32)?));
+    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 32)?));
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
@@ -1519,8 +1502,8 @@ fn test_fill_random() -> Result<()> {
         let key = get_next_u128(&mut rng);
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
-            match e.downcast::<HashedArrayTrieError>().unwrap() {
-                HashedArrayTrieError::OutOfMemory(_) => storage.borrow_mut().resize(),
+            match e.downcast::<Error>().unwrap() {
+                Error::OutOfMemory(_) => storage.borrow_mut().resize(),
                 err => Err(err.into()),
             }?;
         }
@@ -1572,22 +1555,19 @@ fn test_fill_random() -> Result<()> {
 fn test_allocations() -> Result<()> {
     for sz in 1..=512 {
         #[cfg(not(miri))]
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_file(
+        let storage = Rc::new(RefCell::new(Storage::new_file(
             tempfile()?,
             sz * size_of::<u64>() as u64,
         )?));
         #[cfg(miri)]
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::new(
-            Path::new(""),
-            sz * size_of::<u64>() as u64,
-        )?));
+        let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), sz * size_of::<u64>() as u64)?));
 
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         for i in 0..=255 {
             while let Err(e) = trie.insert(i, i as u64) {
-                match e.downcast::<HashedArrayTrieError>().unwrap() {
-                    HashedArrayTrieError::OutOfMemory(_) => storage.borrow_mut().resize(),
+                match e.downcast::<Error>().unwrap() {
+                    Error::OutOfMemory(_) => storage.borrow_mut().resize(),
                     err => Err(err.into()),
                 }?;
             }
@@ -1605,7 +1585,7 @@ fn test_storage_restore_simple() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_ref(&fileref, 296)?));
+        let storage = Rc::new(RefCell::new(Storage::new_ref(&fileref, 296)?));
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         trie.insert(1, 1).expect("Insertion failure!");
@@ -1613,7 +1593,7 @@ fn test_storage_restore_simple() -> Result<()> {
     }
 
     {
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::restore_file(fileref)?));
+        let storage = Rc::new(RefCell::new(Storage::restore_file(fileref)?));
         let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
         assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     }
@@ -1627,7 +1607,7 @@ fn test_storage_restore() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::new_ref(&fileref, 1 << 16)?));
+        let storage = Rc::new(RefCell::new(Storage::new_ref(&fileref, 1 << 16)?));
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
         // Fill an 8-bit trie with with every single possible key
         let mut v: Vec<u8> = (0..=u8::MAX).collect();
@@ -1645,7 +1625,7 @@ fn test_storage_restore() -> Result<()> {
     }
 
     {
-        let storage = Rc::new(RefCell::new(HashedArrayStorage::restore_file(fileref)?));
+        let storage = Rc::new(RefCell::new(Storage::restore_file(fileref)?));
         let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         for i in 0..=u8::MAX {

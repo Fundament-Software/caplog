@@ -3,7 +3,7 @@ use crate::murmur3::{murmur3_aligned, murmur3_aligned_inner, murmur3_finalize};
 use crate::offset_io::{OffsetRead, OffsetWrite, ReadSessionBuf};
 use crate::ring_buf_writer::RingBufWriter;
 
-use super::hashed_array_trie::{HashedArrayStorage, HashedArrayTrie, HashedArrayTrieError};
+use super::hashed_array_trie::{self, HashedArrayTrie, Storage};
 
 use super::sorted_map::SortedMap;
 use capnp::message::{self, ReaderOptions, TypedReader};
@@ -26,14 +26,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::sync::RwLock;
-use thiserror::Error;
 
 #[cfg(test)]
 use capnp::message::Allocator;
 
 #[allow(dead_code)]
-#[derive(Error, Debug)]
-pub enum CapLogError {
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
     #[error("value {v:?} is out of bounds: [{minimum:?}-{maximum:?}]")]
     OutOfBounds { v: u64, minimum: u64, maximum: u64 },
     #[error("Expected schema hash {0} but found {1}")]
@@ -69,7 +68,7 @@ impl HeaderStart {
     #[inline]
     pub fn new(bytes: &[u8]) -> Result<HeaderStart> {
         if bytes.len() < size_of::<HeaderStart>() {
-            return Err(CapLogError::OutOfBounds {
+            return Err(Error::OutOfBounds {
                 v: bytes.len() as u64,
                 minimum: size_of::<HeaderStart>() as u64,
                 maximum: u64::MAX,
@@ -344,12 +343,12 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     ) -> Result<Self> {
         let trie_storage = if let Ok(file) = OpenOptions::new().read(true).write(true).create(false).open(trie_file) {
             if trie_file.metadata()?.len() == 0 {
-                HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
+                Storage::new(trie_file, 2_u64.pow(16))?
             } else {
-                HashedArrayStorage::load_file(file)?
+                Storage::load_file(file)?
             }
         } else {
-            HashedArrayStorage::new(trie_file, 2_u64.pow(16))?
+            Storage::new(trie_file, 2_u64.pow(16))?
         };
 
         Self::new_storage(
@@ -363,7 +362,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
     pub fn new_storage(
         max_file_size: u64,
-        trie_storage: HashedArrayStorage,
+        trie_storage: Storage,
         data_prefix: &Path,
         max_open_files: usize,
         check_consistency: bool,
@@ -387,7 +386,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
                 let mut headerstartbuf = [0_u8; size_of::<HeaderStart>()];
                 file.read_at(&mut headerstartbuf, 0)?;
                 if (HeaderStart::new(&headerstartbuf)?.flags & HeaderFlags::Clean as u64) == 0 {
-                    return Err(CapLogError::DirtyFile.into());
+                    return Err(Error::DirtyFile.into());
                 }
 
                 if check_consistency {
@@ -411,7 +410,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
                         let expected = u128::from_le_bytes(buf);
 
                         if hash != expected {
-                            return Err(CapLogError::CorruptData(hash, expected).into());
+                            return Err(Error::CorruptData(hash, expected).into());
                         }
                     }
                 }
@@ -420,7 +419,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
                 (file, id)
             } else {
-                return Err(CapLogError::FileError.into());
+                return Err(Error::FileError.into());
             }
         } else {
             (archive.new_file(0)?, 0)
@@ -482,7 +481,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         builder: &mut capnp::any_pointer::Builder<'_>,
     ) -> Result<()> {
         // Okay, try to find the file
-        let f = self.archive.get_data_file(id).ok_or(CapLogError::FileError)?;
+        let f = self.archive.get_data_file(id).ok_or(Error::FileError)?;
 
         let mut session: ReadSessionBuf<'_, FileType, 4096> = ReadSessionBuf::new(&f, offset);
 
@@ -501,7 +500,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             let expected = u128::from_le_bytes(buf);
 
             if hash != expected {
-                return Err(CapLogError::CorruptData(hash, expected).into());
+                return Err(Error::CorruptData(hash, expected).into());
             }
 
             capnp::message::Reader::new(segments, self.options)
@@ -515,7 +514,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         let snowflake_id = entry.get_snowflake_id();
         let entry_id = ((machine_id as u128) << 64) | snowflake_id as u128;
         if entry_id != id {
-            return Err(CapLogError::Mismatch(entry_id, id, (id >> 64) as u64, id as u64).into());
+            return Err(Error::Mismatch(entry_id, id, (id >> 64) as u64, id as u64).into());
         }
 
         builder.set_as(entry.get_payload())?;
@@ -525,8 +524,8 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     fn finalize(
         &mut self,
     ) -> Result<(
-        std::sync::MutexGuard<'_, crate::ring_buf_writer::RingBufFlusher<FileType>>,
-        &crate::ring_buf_writer::RingBufState,
+        std::sync::MutexGuard<'_, crate::ring_buf_writer::Flusher<FileType>>,
+        &crate::ring_buf_writer::State,
     )> {
         if let Ok((mut flusher, state)) = self.data_file.lock_flusher() {
             // Dump current buffer
@@ -549,7 +548,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
             Ok((flusher, state))
         } else {
-            Err(CapLogError::FileError.into())
+            Err(Error::FileError.into())
         }
     }
 
@@ -566,7 +565,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
             // We swap the file pointers here and then simply drop this one, because we already have a clone in the archive.
             flusher.swap_inner::<BUFFER_SIZE>(state, &mut file, position)?;
         } else {
-            return Err(CapLogError::Unknown.into());
+            return Err(Error::Unknown.into());
         }
 
         self.last_flush = 0;
@@ -582,8 +581,8 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     #[inline]
     fn trie_insert(&mut self, id: u128, value: u64) -> Result<()> {
         while let Err(e) = self.trie.insert(id, value) {
-            match e.downcast::<HashedArrayTrieError>()? {
-                HashedArrayTrieError::OutOfMemory(_) => self.trie.storage.borrow_mut().resize(),
+            match e.downcast::<hashed_array_trie::Error>()? {
+                hashed_array_trie::Error::OutOfMemory(_) => self.trie.storage.borrow_mut().resize(),
                 err => Err(err.into()),
             }?;
         }
@@ -624,7 +623,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         builder.get_payload().set_as(payload)?;
 
         if id < self.current_id {
-            let mut handle = self.archive.get_append_file(id).ok_or(CapLogError::FileError)?;
+            let mut handle = self.archive.get_append_file(id).ok_or(Error::FileError)?;
             let position = handle.stream_position()?;
             assert_ne!(position, 0);
 

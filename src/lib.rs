@@ -1,6 +1,6 @@
 mod caplog;
 pub use crate::caplog::CapLog;
-pub use crate::caplog::CapLogError;
+pub use crate::caplog::Error;
 pub use crate::caplog::MAX_BUFFER_SIZE;
 pub use crate::caplog::MAX_FILE_SIZE;
 pub use crate::caplog::MAX_OPEN_FILES;
