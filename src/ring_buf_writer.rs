@@ -6,12 +6,12 @@ use std::io::{Result, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-pub struct RingBufFlusher<W: ?Sized + OffsetWrite> {
+pub struct Flusher<W: ?Sized + OffsetWrite> {
     panicked: bool,
     inner: W,
 }
 
-pub struct RingBufState {
+pub struct State {
     staging: UnsafeCell<Box<[u8]>>,
     start: AtomicUsize,
     marker: AtomicUsize,
@@ -19,32 +19,32 @@ pub struct RingBufState {
     write_head: AtomicU64,
 }
 
-unsafe impl Sync for RingBufState {}
+unsafe impl Sync for State {}
 
 /// This is a ring-buffered writer with an atomic write marker that allows
 /// one thread to write and one thread to flush to disk.
 pub struct RingBufWriter<W: ?Sized + OffsetWrite, const POW2_SIZE: usize> {
-    state: RingBufState,
-    flusher: Mutex<RingBufFlusher<W>>,
+    state: State,
+    flusher: Mutex<Flusher<W>>,
 }
 
 impl<W: OffsetWrite, const POW2_SIZE: usize> RingBufWriter<W, POW2_SIZE> {
     pub fn new(inner: W, position: u64) -> RingBufWriter<W, POW2_SIZE> {
         RingBufWriter {
-            state: RingBufState {
+            state: State {
                 staging: UnsafeCell::new(vec![0_u8; POW2_SIZE].into_boxed_slice()),
                 start: AtomicUsize::new(0),
                 marker: AtomicUsize::new(0),
                 flush_head: AtomicU64::new(0),
                 write_head: AtomicU64::new(position),
             },
-            flusher: Mutex::new(RingBufFlusher { panicked: false, inner }),
+            flusher: Mutex::new(Flusher { panicked: false, inner }),
         }
     }
 }
 
-impl<W: OffsetWrite> RingBufFlusher<W> {
-    pub fn swap_inner<const SIZE: usize>(&mut self, state: &RingBufState, other: &mut W, position: u64) -> Result<()> {
+impl<W: OffsetWrite> Flusher<W> {
+    pub fn swap_inner<const SIZE: usize>(&mut self, state: &State, other: &mut W, position: u64) -> Result<()> {
         std::mem::swap(&mut self.inner, other);
         state.flush_head.store(0, Ordering::Release);
         state.write_head.store(position, Ordering::Release);
@@ -52,7 +52,7 @@ impl<W: OffsetWrite> RingBufFlusher<W> {
     }
 }
 
-impl RingBufState {
+impl State {
     #[inline]
     pub fn len<const SIZE: usize>(&self) -> usize {
         let start = self.start.load(Ordering::Acquire);
@@ -68,7 +68,7 @@ fn mutex_lock_err() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "Could not acquire mutex!")
 }
 
-impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
+impl<W: ?Sized + OffsetWrite> Flusher<W> {
     pub fn get_ref(&self) -> &W {
         &self.inner
     }
@@ -80,7 +80,7 @@ impl<W: ?Sized + OffsetWrite> RingBufFlusher<W> {
     /// Flush all data up to the commit marker into our writer. We ignore any data that
     /// hasn't been committed to, because we allow writers to manipulate data they've
     /// written but not committed.
-    pub fn flush_buf<const SIZE: usize>(&mut self, state: &RingBufState) -> Result<()> {
+    pub fn flush_buf<const SIZE: usize>(&mut self, state: &State) -> Result<()> {
         let mut start = state.start.load(Ordering::Acquire);
         let mut position = state.write_head.load(Ordering::Acquire);
         let marker = state.marker.load(Ordering::Acquire);
@@ -274,10 +274,8 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     #[allow(clippy::type_complexity)]
     pub fn lock_flusher(
         &self,
-    ) -> std::result::Result<
-        (MutexGuard<'_, RingBufFlusher<W>>, &RingBufState),
-        std::sync::PoisonError<MutexGuard<'_, RingBufFlusher<W>>>,
-    > {
+    ) -> std::result::Result<(MutexGuard<'_, Flusher<W>>, &State), std::sync::PoisonError<MutexGuard<'_, Flusher<W>>>>
+    {
         self.flusher.lock().map(|x| (x, &self.state))
     }
 }

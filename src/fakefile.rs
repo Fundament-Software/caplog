@@ -3,12 +3,12 @@ use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
 // Defines a simple fake file because the mocks library is too heavy handed for this.
-struct FakeFileInner {
+struct Inner {
     inner: Vec<u8>,
     position: u64,
 }
 
-impl FakeFileInner {
+impl Inner {
     fn write_inner(&mut self, buf: &[u8], position: Option<u64>) -> usize {
         let pos = position.unwrap_or(self.position) as usize;
         let end = buf.len() + pos;
@@ -35,13 +35,13 @@ impl FakeFileInner {
 }
 
 pub struct FakeFile {
-    inner: Arc<Mutex<FakeFileInner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl FakeFile {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(FakeFileInner {
+            inner: Arc::new(Mutex::new(Inner {
                 inner: Vec::new(),
                 position: 0,
             })),
