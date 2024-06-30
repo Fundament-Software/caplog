@@ -54,7 +54,7 @@ impl<const BUFFER_SIZE: usize> log_sink::Server for RefCell<CapLog<BUFFER_SIZE>>
 }
 
 #[cfg(test)]
-use super::hashed_array_trie::HashedArrayStorage;
+use super::hashed_array_trie::Storage;
 #[cfg(test)]
 use crate::log_capnp::log_entry;
 #[cfg(test)]
@@ -138,7 +138,7 @@ async fn test_basic_log() -> Result<()> {
     let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<MAX_BUFFER_SIZE>::new_storage(
             65535,
@@ -180,7 +180,7 @@ async fn test_basic_threading() -> Result<()> {
     let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(16))?;
         let logger = RefCell::new(CapLog::<MAX_BUFFER_SIZE>::new_storage(
             65535,
             trie_storage,
@@ -235,9 +235,9 @@ fn test_basic_miri() -> eyre::Result<()> {
 
     {
         #[cfg(not(miri))]
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(8))?;
         #[cfg(miri)]
-        let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
         let mut logger = CapLog::<MAX_BUFFER_SIZE>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
 
@@ -272,7 +272,7 @@ async fn test_buffer_loop() -> Result<()> {
     let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<128>::new_storage(
             512,
@@ -319,9 +319,9 @@ fn test_buffer_bypass() -> eyre::Result<()> {
 
     {
         #[cfg(not(miri))]
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(8))?;
         #[cfg(miri)]
-        let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
         let mut logger = CapLog::<8>::new_storage(65535, trie_storage, &guard.prefix, 10, false)?;
 
@@ -359,9 +359,9 @@ fn test_file_bypass() -> eyre::Result<()> {
 
     {
         #[cfg(not(miri))]
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(8))?;
         #[cfg(miri)]
-        let trie_storage = HashedArrayStorage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
+        let trie_storage = Storage::new(std::path::Path::new("/"), 2_u64.pow(8))?;
 
         let mut logger = CapLog::<8>::new_storage(8, trie_storage, &guard.prefix, 10, false)?;
 
@@ -396,7 +396,7 @@ async fn test_file_reload() -> Result<()> {
     let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?.into_temp_path();
     {
-        let trie_storage = HashedArrayStorage::new(&trie_file, 2_u64.pow(16))?;
+        let trie_storage = Storage::new(&trie_file, 2_u64.pow(16))?;
         let logger = RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
             trie_storage,
@@ -431,7 +431,7 @@ async fn test_file_reload() -> Result<()> {
 
     #[cfg(not(miri))]
     {
-        let trie_storage = HashedArrayStorage::load(&trie_file)?;
+        let trie_storage = Storage::load(&trie_file)?;
         let logger = RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
             trie_storage,
@@ -457,7 +457,7 @@ async fn test_file_integrity() -> Result<()> {
     let guard = TempFileGuard::new();
     let trie_file = NamedTempFile::new()?;
     {
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(16))?;
         let mut set = capnp_rpc::CapabilityServerSet::new();
         let client: log_sink::Client = set.new_client(RefCell::new(CapLog::<128>::new_storage(
             crate::caplog::MAX_FILE_SIZE,
@@ -484,7 +484,7 @@ async fn test_file_integrity() -> Result<()> {
     }
 
     {
-        let trie_storage = HashedArrayStorage::new(trie_file.path(), 2_u64.pow(16))?;
+        let trie_storage = Storage::new(trie_file.path(), 2_u64.pow(16))?;
         let _ = CapLog::<128>::new_storage(crate::caplog::MAX_FILE_SIZE, trie_storage, &guard.prefix, 10, true)?;
     }
 
