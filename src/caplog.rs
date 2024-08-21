@@ -46,7 +46,7 @@ pub enum Error {
     #[error("Tried to allocate a buffer for {0} bytes but only had {1} left")]
     NotEnoughBuffer(usize, usize),
     #[error("File I/O error encountered or filesystem in bad state")]
-    FileError,
+    FileFailure,
     #[error("File was not closed properly")]
     DirtyFile,
     #[error("unknown caplog error")]
@@ -419,7 +419,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
                 (file, id)
             } else {
-                return Err(Error::FileError.into());
+                return Err(Error::FileFailure.into());
             }
         } else {
             (archive.new_file(0)?, 0)
@@ -481,7 +481,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         builder: &mut capnp::any_pointer::Builder<'_>,
     ) -> Result<()> {
         // Okay, try to find the file
-        let f = self.archive.get_data_file(id).ok_or(Error::FileError)?;
+        let f = self.archive.get_data_file(id).ok_or(Error::FileFailure)?;
 
         let mut session: ReadSessionBuf<'_, FileType, 4096> = ReadSessionBuf::new(&f, offset);
 
@@ -548,7 +548,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
 
             Ok((flusher, state))
         } else {
-            Err(Error::FileError.into())
+            Err(Error::FileFailure.into())
         }
     }
 
@@ -623,7 +623,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         builder.get_payload().set_as(payload)?;
 
         if id < self.current_id {
-            let mut handle = self.archive.get_append_file(id).ok_or(Error::FileError)?;
+            let mut handle = self.archive.get_append_file(id).ok_or(Error::FileFailure)?;
             let position = handle.stream_position()?;
             assert_ne!(position, 0);
 

@@ -9,7 +9,6 @@ license = "Apache-2.0"
 [dependencies]
 capstone = { git = "https://github.com/Fundament-Software/capstone-rs" }
 capstone-futures = { git = "https://github.com/Fundament-Software/capstone-rs" }
-capstone-import = { git = "https://github.com/Fundament-Software/capstone-rs" }
 capstone-rpc = { git = "https://github.com/Fundament-Software/capstone-rs" }
 capstone-macros = { git = "https://github.com/Fundament-Software/capstone-rs" }
 color-eyre = "0.6"
@@ -22,6 +21,9 @@ num = { version = "0.4.1", features = ["std"] }
 # quicklz = "0.3"
 rand = "0.8.5"
 tempfile = "3"
+
+[build-dependencies]
+capstone-gen = { git = "https://github.com/Fundament-Software/capstone-rs" }
 
 [dev-dependencies]
 murmur3 = "0.5.1"

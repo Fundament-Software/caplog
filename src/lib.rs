@@ -13,7 +13,11 @@ mod ring_buf_writer;
 pub mod sorted_map;
 use bitfield_struct::bitfield;
 pub mod hashed_array_trie;
-capnp_import::capnp_import!("log.capnp");
+
+pub mod log_capnp {
+    include!(concat!(env!("OUT_DIR"), "/log_capnp.rs"));
+}
+
 #[cfg(miri)]
 mod fakefile;
 
