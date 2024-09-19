@@ -738,25 +738,30 @@ impl Storage {
     #[cfg(not(miri))]
     pub fn resize(&mut self) -> Result<()> {
         self.flush()?;
-        if let Some(m) = &mut self.mapping {
-            let old_size = m.len();
-            let new_size = old_size * 2;
-            if let Some(handle) = self.handle.as_ref() {
-                handle.set_len(new_size as u64)?;
-
+        if let Some(handle) = self.handle.as_ref() {
+            let old = mem::take(&mut self.mapping);
+            if let Some(mut m) = old {
+                let old_size = m.len();
+                let new_size = old_size * 2;
+                // Attempt an in-place resize
                 unsafe {
-                    if let Err(e) = m.remap(new_size, memmap2::RemapOptions::new().may_move(true)) {
-                        drop(m);
-                        if let Some(handle) = self.handle.as_ref() {
-                            handle.set_len(new_size as u64)?;
-
-                            self.mapping = Some(MmapMut::map_mut(handle)?);
+                    self.mapping = Some(if handle.set_len(new_size as u64).is_ok() {
+                        if m.remap(new_size, memmap2::RemapOptions::new().may_move(true)).is_err() {
+                            drop(m);
+                            MmapMut::map_mut(handle)?
+                        } else {
+                            m
                         }
-                    }
+                    } else {
+                        drop(m);
+                        handle.set_len(new_size as u64)?;
+                        MmapMut::map_mut(handle)?
+                    });
+
                     self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
                 }
+                return Ok(());
             }
-            return Ok(());
         }
 
         Err(Error::OutOfMemory(0).into())
