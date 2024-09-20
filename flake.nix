@@ -1,7 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs";
-    nixpkgs-21.url = "github:NixOS/nixpkgs/nixos-21.11";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-24.05";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
 
@@ -13,11 +12,6 @@
       url = "github:rustsec/advisory-db";
       flake = false;
     };
-
-    capstone = {
-      url = "github:Fundament-Software/capstone?ref=v2";
-      flake = false;
-    };
   };
 
   outputs =
@@ -25,7 +19,6 @@
     , flake-utils
     , nixpkgs
     , rust-overlay
-    , nixpkgs-21
     , crane
     , advisory-db
     , ...
@@ -44,14 +37,6 @@
         ];
       });
 
-      capnproto = (pkgs.clangStdenv.mkDerivation {
-        pname = "capnproto";
-        version = "v2";
-        src = inputs.capstone;
-        nativeBuildInputs = [ pkgs.cmake ];
-        propagatedBuildInputs = [ pkgs.openssl pkgs.zlib ];
-      });
-      
       rust-nightly-toolchain = (pkgs.rust-bin.nightly.latest.default.override {
         extensions = [
           "rust-src"
@@ -64,7 +49,7 @@
 
     in
     rec {
-      devShells.default = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_15.stdenv; }) {
+      devShells.default = (pkgs.mkShell.override { stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv; }) {
         buildInputs = with pkgs; [
           openssl
           pkg-config
@@ -75,20 +60,14 @@
           rust-custom-toolchain
 
           cargo-edit
-
-          capnproto
-
-          cmake
-
-          ninja
         ];
 
         # fetch with cli instead of native
         CARGO_NET_GIT_FETCH_WITH_CLI = "true";
         RUST_BACKTRACE = 1;
+        RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
       };
 
-      
       devShells.nightly = (pkgs.mkShell.override { stdenv = pkgs.llvmPackages_15.stdenv; }) {
         buildInputs = with pkgs; [
           openssl
@@ -100,12 +79,6 @@
           rust-nightly-toolchain
 
           cargo-edit
-
-          capnproto
-
-          cmake
-
-          ninja
         ];
 
         # fetch with cli instead of native
@@ -119,52 +92,57 @@
         let
           craneLib =
             (inputs.crane.mkLib pkgs).overrideToolchain rust-custom-toolchain;
-          src = ./.;
+          commonArgs = {
+            src = ./.;
+            buildInputs = with pkgs; [ pkg-config openssl zlib ];
+            strictDeps = true;
+            version = "0.1.0";
+            stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv;
+            CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
+          };
+          pname = "capnp-checks";
 
-          cargoArtifacts = craneLib.buildDepsOnly {
-            inherit src;
-            buildInputs = with pkgs; [ openssl pkg-config ];
-          };
-          build-tests = craneLib.buildPackage {
-            inherit cargoArtifacts src;
-            buildInputs = with pkgs; [ openssl pkg-config capnproto ];
-          };
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            inherit pname;
+          });
+          build-tests = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts pname;
+          });
         in
         {
           inherit build-tests;
 
           # Run clippy (and deny all warnings) on the crate source,
-          # again, resuing the dependency artifacts from above.
+          # again, reusing the dependency artifacts from above.
           #
           # Note that this is done as a separate derivation so that
           # we can block the CI if there are issues here, but not
           # prevent downstream consumers from building our crate by itself.
-          my-crate-clippy = craneLib.cargoClippy {
-            inherit cargoArtifacts src;
+          capnp-clippy = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "${pname}-clippy";
             cargoClippyExtraArgs = "-- --deny warnings";
-
-            buildInputs = with pkgs; [ openssl pkg-config capnproto ];
-          };
+          });
 
           # Check formatting
-          my-crate-fmt = craneLib.cargoFmt { inherit src; };
+          capnp-fmt = craneLib.cargoFmt (commonArgs // {
+            pname = "${pname}-fmt";
+          });
 
           # Audit dependencies
-          my-crate-audit = craneLib.cargoAudit {
-            inherit src;
+          capnp-audit = craneLib.cargoAudit (commonArgs // {
+            pname = "${pname}-audit";
             advisory-db = inputs.advisory-db;
             cargoAuditExtraArgs = "--ignore RUSTSEC-2020-0071";
-          };
+          });
 
           # Run tests with cargo-nextest
-          my-crate-nextest = craneLib.cargoNextest {
-            inherit cargoArtifacts src;
+          capnp-nextest = craneLib.cargoNextest (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "${pname}-nextest";
             partitions = 1;
             partitionType = "count";
-
-            buildInputs = with pkgs; [ openssl pkg-config capnproto ];
-          };
+          });
         };
-
     });
 }
