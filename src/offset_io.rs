@@ -186,9 +186,8 @@ impl<'a, R: OffsetRead, const SIZE: usize> Read for &'_ mut ReadSessionBuf<'a, R
         // entirely.
         if self.pos == self.filled && buf.len() >= SIZE {
             self.discard_buffer();
-            return self.inner.read_at(buf, self.offset).map(|x| {
+            return self.inner.read_at(buf, self.offset).inspect(|&x| {
                 self.offset += x as u64;
-                x
             });
         }
         let mut rem = self.fill_buf()?;
@@ -238,10 +237,12 @@ impl<'a, R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'a
             debug_assert!(self.pos == self.filled);
 
             unsafe {
-                self.filled = self.inner.read_at(self.buf.assume_init_mut(), self.offset).map(|x| {
-                    self.offset += x as u64;
-                    x
-                })?;
+                self.filled = self
+                    .inner
+                    .read_at(self.buf.assume_init_mut(), self.offset)
+                    .inspect(|&x| {
+                        self.offset += x as u64;
+                    })?;
             }
 
             self.pos = 0;

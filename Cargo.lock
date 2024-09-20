@@ -115,7 +115,7 @@ dependencies = [
 [[package]]
 name = "capnp-sys"
 version = "1.1.0"
-source = "git+https://github.com/Fundament-Software/capstone#44d045a30a9574fde4fd8c0e344445d49f55badd"
+source = "git+https://github.com/Fundament-Software/capstone#d59c7fd6d724d8f91ea61407ca07452af5a7cf1c"
 dependencies = [
  "cc",
  "cxx",
@@ -128,7 +128,7 @@ dependencies = [
 [[package]]
 name = "capnpc-sys"
 version = "1.1.0"
-source = "git+https://github.com/Fundament-Software/capstone#44d045a30a9574fde4fd8c0e344445d49f55badd"
+source = "git+https://github.com/Fundament-Software/capstone#d59c7fd6d724d8f91ea61407ca07452af5a7cf1c"
 dependencies = [
  "capnp-sys",
  "cc",
@@ -142,7 +142,7 @@ dependencies = [
 [[package]]
 name = "capstone"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#e96784b51651aa54b3bd4d0b9842ff474de7aadd"
+source = "git+https://github.com/Fundament-Software/capstone-rs#31e622af4e91ddabcd8de83ccb2168bc46c27fbb"
 dependencies = [
  "embedded-io",
  "flurry",
@@ -152,7 +152,7 @@ dependencies = [
 [[package]]
 name = "capstone-futures"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#e96784b51651aa54b3bd4d0b9842ff474de7aadd"
+source = "git+https://github.com/Fundament-Software/capstone-rs#31e622af4e91ddabcd8de83ccb2168bc46c27fbb"
 dependencies = [
  "capstone",
  "futures-util",
@@ -163,7 +163,7 @@ dependencies = [
 [[package]]
 name = "capstone-gen"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#e96784b51651aa54b3bd4d0b9842ff474de7aadd"
+source = "git+https://github.com/Fundament-Software/capstone-rs#31e622af4e91ddabcd8de83ccb2168bc46c27fbb"
 dependencies = [
  "capnpc-sys",
  "capstone",
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "capstone-macros"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#e96784b51651aa54b3bd4d0b9842ff474de7aadd"
+source = "git+https://github.com/Fundament-Software/capstone-rs#31e622af4e91ddabcd8de83ccb2168bc46c27fbb"
 dependencies = [
  "capstone",
  "capstone-gen",
@@ -189,7 +189,7 @@ dependencies = [
 [[package]]
 name = "capstone-rpc"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#e96784b51651aa54b3bd4d0b9842ff474de7aadd"
+source = "git+https://github.com/Fundament-Software/capstone-rs#31e622af4e91ddabcd8de83ccb2168bc46c27fbb"
 dependencies = [
  "capstone",
  "capstone-futures",
@@ -541,7 +541,7 @@ checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
 [[package]]
 name = "kj-build"
 version = "1.1.0"
-source = "git+https://github.com/Fundament-Software/capstone#44d045a30a9574fde4fd8c0e344445d49f55badd"
+source = "git+https://github.com/Fundament-Software/capstone#d59c7fd6d724d8f91ea61407ca07452af5a7cf1c"
 dependencies = [
  "cc",
  "eyre",
@@ -551,7 +551,7 @@ dependencies = [
 [[package]]
 name = "kj-sys"
 version = "1.1.0"
-source = "git+https://github.com/Fundament-Software/capstone#44d045a30a9574fde4fd8c0e344445d49f55badd"
+source = "git+https://github.com/Fundament-Software/capstone#d59c7fd6d724d8f91ea61407ca07452af5a7cf1c"
 dependencies = [
  "cc",
  "cxx",
@@ -1187,15 +1187,15 @@ checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0336d538f7abc86d282a4189614dfaa90810dfc2c6f6427eaf88e16311dd225d"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-xid"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "229730647fbc343e3a80e463c1db7f78f3855d3f3739bee0dda773c9a037c90a"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "valuable"
