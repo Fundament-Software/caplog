@@ -15,9 +15,9 @@ jobs:
     strategy:
       matrix:
         rust:
-          - nightly
-          - beta
           - stable
+          - beta
+          - nightly
     runs-on: ubuntu-latest
 
     steps:
