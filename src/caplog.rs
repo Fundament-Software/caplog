@@ -339,13 +339,27 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         trie_file: &Path,
         data_prefix: &Path,
         max_open_files: usize,
+        restore: bool,
         check_consistency: bool,
     ) -> Result<Self> {
         let trie_storage = if let Ok(file) = OpenOptions::new().read(true).write(true).create(false).open(trie_file) {
             if trie_file.metadata()?.len() == 0 {
                 Storage::new(trie_file, 2_u64.pow(16))?
             } else {
-                Storage::load_file(file)?
+                let r = Storage::load_file(file);
+                match r {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if restore {
+                            match e.downcast::<hashed_array_trie::Error>()? {
+                                hashed_array_trie::Error::DirtyTrieState => Storage::restore(trie_file),
+                                e => Err(e.into()),
+                            }
+                        } else {
+                            Err(e)
+                        }?
+                    }
+                }
             }
         } else {
             Storage::new(trie_file, 2_u64.pow(16))?
