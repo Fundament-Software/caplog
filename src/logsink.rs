@@ -8,6 +8,7 @@ use capnp_macros::capnproto_rpc;
 use core::future::Future;
 use std::cell::RefCell;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
@@ -29,7 +30,7 @@ impl Future for LogFuture {
 #[capnproto_rpc(log_sink)]
 impl<const BUFFER_SIZE: usize> log_sink::Server for RefCell<CapLog<BUFFER_SIZE>> {
     async fn log(
-        &self,
+        self: Rc<Self>,
         snowflake_id: u64,
         machine_id: u64,
         instance_id: u64,
