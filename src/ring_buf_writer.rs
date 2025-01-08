@@ -280,7 +280,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
     }
 }
 
-impl<'a, W: ?Sized + OffsetWrite, const SIZE: usize> Write for &'a RingBufWriter<W, SIZE> {
+impl<W: ?Sized + OffsetWrite, const SIZE: usize> Write for &RingBufWriter<W, SIZE> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         // Use < instead of <= to avoid a needless trip through the buffer in some cases.
