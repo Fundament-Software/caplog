@@ -179,7 +179,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> ReadSessionBuf<'a, R, SIZE> {
     }
 }
 
-impl<'a, R: OffsetRead, const SIZE: usize> Read for &'_ mut ReadSessionBuf<'a, R, SIZE> {
+impl<R: OffsetRead, const SIZE: usize> Read for &'_ mut ReadSessionBuf<'_, R, SIZE> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // If we don't have any buffered data and we're doing a massive read
         // (larger than our internal buffer), bypass our internal buffer
@@ -226,7 +226,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> Read for &'_ mut ReadSessionBuf<'a, R
     }
 }
 
-impl<'a, R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'a, R, SIZE> {
+impl<R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'_, R, SIZE> {
     #[inline]
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         // If we've reached the end of our internal buffer then we need to fetch
@@ -256,7 +256,7 @@ impl<'a, R: OffsetRead, const SIZE: usize> BufRead for &'_ mut ReadSessionBuf<'a
     }
 }
 
-impl<'a, R: OffsetRead, const SIZE: usize> Seek for &'_ mut ReadSessionBuf<'a, R, SIZE> {
+impl<R: OffsetRead, const SIZE: usize> Seek for &'_ mut ReadSessionBuf<'_, R, SIZE> {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let n = match pos {
             io::SeekFrom::Start(n) => n as i64,

@@ -267,7 +267,7 @@ impl<K: Ord, V> IntoIterator for SortedMap<K, V> {
     }
 }
 
-impl<'a, K, Q, V> Index<&'a Q> for SortedMap<K, V>
+impl<K, Q, V> Index<&Q> for SortedMap<K, V>
 where
     K: Ord + Borrow<Q>,
     Q: Ord + ?Sized,
@@ -279,7 +279,7 @@ where
     }
 }
 
-impl<'a, K, Q, V> IndexMut<&'a Q> for SortedMap<K, V>
+impl<K, Q, V> IndexMut<&Q> for SortedMap<K, V>
 where
     K: Ord + Borrow<Q>,
     Q: Ord + ?Sized,
