@@ -127,7 +127,7 @@ dependencies = [
 [[package]]
 name = "capstone"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#1b16084684fe58e6f4a45f0dd04ab9fd963ae616"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6d8fa244c76cafee42cba9e531a548086692f199"
 dependencies = [
  "embedded-io",
  "flurry",
@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "capstone-futures"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#1b16084684fe58e6f4a45f0dd04ab9fd963ae616"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6d8fa244c76cafee42cba9e531a548086692f199"
 dependencies = [
  "capstone",
  "futures-util",
@@ -148,7 +148,7 @@ dependencies = [
 [[package]]
 name = "capstone-gen"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#1b16084684fe58e6f4a45f0dd04ab9fd963ae616"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6d8fa244c76cafee42cba9e531a548086692f199"
 dependencies = [
  "capnp-sys",
  "capstone",
@@ -160,7 +160,7 @@ dependencies = [
 [[package]]
 name = "capstone-macros"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#1b16084684fe58e6f4a45f0dd04ab9fd963ae616"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6d8fa244c76cafee42cba9e531a548086692f199"
 dependencies = [
  "capstone",
  "capstone-gen",
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "capstone-rpc"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#1b16084684fe58e6f4a45f0dd04ab9fd963ae616"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6d8fa244c76cafee42cba9e531a548086692f199"
 dependencies = [
  "capstone",
  "capstone-futures",
@@ -191,9 +191,9 @@ checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "cc"
-version = "1.2.21"
+version = "1.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8691782945451c1c383942c4874dbe63814f61cb57ef773cda2972682b7bb3c0"
+checksum = "32db95edf998450acc7881c932f94cd9b05c87b4b2599e8bab064753da4acfd1"
 dependencies = [
  "shlex",
 ]
@@ -310,9 +310,9 @@ dependencies = [
 
 [[package]]
 name = "convert_case"
-version = "0.6.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+checksum = "baaaa0ecca5b51987b9423ccdc971514dd8b0bb7b4060b983d3664dad3f1f89f"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -540,9 +540,9 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73fea8450eea4bac3940448fb7ae50d91f034f941199fcd9d909a5a07aa455f0"
+checksum = "26145e563e54f2cadc477553f1ec5ee650b00862f0a58bcd12cbdc5f0ea2d2f4"
 dependencies = [
  "cfg-if",
  "libc",
@@ -889,7 +889,7 @@ version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
- "getrandom 0.3.2",
+ "getrandom 0.3.3",
 ]
 
 [[package]]
@@ -1066,7 +1066,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7437ac7763b9b123ccf33c338a5cc1bac6f69b45a136c19bdd8a65e3916435bf"
 dependencies = [
  "fastrand",
- "getrandom 0.3.2",
+ "getrandom 0.3.3",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
