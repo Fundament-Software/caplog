@@ -147,11 +147,11 @@ mod test {
         const MAXCOUNT: usize = 10000;
 
         for i in 0..MAXCOUNT {
-            let len: u8 = rng.gen();
+            let len: u8 = rng.random();
             let mut buf: Vec<u64> = vec![0; len as usize];
             let (_, inner, _) = unsafe { buf.align_to_mut::<u8>() };
             rng.fill_bytes(inner);
-            let salt: u32 = rng.gen();
+            let salt: u32 = rng.random();
             let b = murmur3::murmur3_x64_128(&mut Cursor::new(inner), salt).unwrap();
             let a = murmur3_aligned(&buf[..], salt as u128 | (salt as u128) << 64);
             assert_eq!(

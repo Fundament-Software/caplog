@@ -57,11 +57,7 @@ impl State {
     pub fn len<const SIZE: usize>(&self) -> usize {
         let start = self.start.load(Ordering::Acquire);
         let end = self.marker.load(Ordering::Acquire);
-        if start > end {
-            SIZE - start + end
-        } else {
-            end - start
-        }
+        if start > end { SIZE - start + end } else { end - start }
     }
 }
 fn mutex_lock_err() -> std::io::Error {
@@ -259,7 +255,7 @@ impl<W: ?Sized + OffsetWrite, const SIZE: usize> RingBufWriter<W, SIZE> {
 
         // SAFETY: This operation is safe provided that we are accurately keeping track
         // of which sections of the buffer are being written to vs. being flushed.
-        let staging = &mut *self.state.staging.get();
+        let staging = unsafe { &mut *self.state.staging.get() };
 
         if end <= SIZE {
             staging[start..end].copy_from_slice(src);
