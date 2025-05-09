@@ -7,8 +7,8 @@ use super::hashed_array_trie::{self, HashedArrayTrie, Storage};
 
 use super::sorted_map::SortedMap;
 use capnp::message::{self, ReaderOptions, TypedReader};
-use eyre::eyre;
 use eyre::Result;
+use eyre::eyre;
 use std::alloc;
 use std::cell::RefCell;
 
@@ -22,10 +22,10 @@ use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 #[cfg(test)]
 use capnp::message::Allocator;
@@ -299,7 +299,7 @@ unsafe impl capnp::message::Allocator for StagingAlloc {
     }
 
     unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32) {
-        let slice = &*std::ptr::slice_from_raw_parts(ptr as *const u64, words_used as usize);
+        let slice = unsafe { &*std::ptr::slice_from_raw_parts(ptr as *const u64, words_used as usize) };
         self.hash = murmur3_aligned_inner(slice, self.hash, self.hash_len);
         self.hash_len += slice.len();
         if self.staging.as_ptr() as *const u8 == ptr {

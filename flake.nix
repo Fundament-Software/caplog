@@ -1,13 +1,10 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
 
-    crane = {
-      url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
     advisory-db = {
       url = "github:rustsec/advisory-db";
       flake = false;
@@ -86,8 +83,6 @@
         RUST_BACKTRACE = 1;
       };
 
-      default = { };
-
       checks =
         let
           craneLib =
@@ -97,7 +92,7 @@
             buildInputs = with pkgs; [ pkg-config openssl zlib ];
             strictDeps = true;
             version = "0.1.0";
-            stdenv = pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv;
+            stdenv = pkgs: pkgs.stdenvAdapters.useMoldLinker pkgs.llvmPackages_15.stdenv;
             CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
           };
           pname = "capnp-checks";
