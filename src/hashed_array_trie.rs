@@ -84,11 +84,7 @@ impl Flags {
     #[inline]
     fn parity_location(&self) -> u8 {
         // We hide the parity either in the skip count or in the skip bits depending on if skip count is 4 or not
-        if (self.0 & (1 << 43)) != 0 {
-            41
-        } else {
-            63
-        }
+        if (self.0 & (1 << 43)) != 0 { 41 } else { 63 }
     }
     #[inline]
     fn calc_parity(&self) -> u32 {
@@ -298,7 +294,8 @@ impl Storage {
 
     unsafe fn init_self(&mut self) -> Result<()> {
         // We do this alignment check once, and the rest of the time we do the unguarded direct mutation.
-        let (prefix, slice, tail) = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>();
+        let (prefix, slice, tail) =
+            unsafe { &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>() };
 
         if !prefix.is_empty() {
             return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
@@ -322,14 +319,13 @@ impl Storage {
 
         // If init section fails, we will leave a file full of zeros, which is okay because that's considered invalid
         // anyway.
-        self.init_section(
-            HEADER_BYTES + MAX_NODE_BYTES + size_of::<u64>(),
-            self.mapping.as_ref().unwrap_unchecked().len(),
-        )?;
+        self.init_section(HEADER_BYTES + MAX_NODE_BYTES + size_of::<u64>(), unsafe {
+            self.mapping.as_ref().unwrap_unchecked().len()
+        })?;
 
         // flush our clean value of 0 so we can detect if we aren't closed properly
         #[cfg(not(miri))]
-        self.mapping.as_mut().unwrap_unchecked().flush_range(0, HEADER_BYTES)?;
+        unsafe { self.mapping.as_mut().unwrap_unchecked().flush_range(0, HEADER_BYTES) }?;
 
         Ok(())
     }
@@ -346,7 +342,7 @@ impl Storage {
             //dirty_pages: HashSet::new(),
         };
 
-        result.init_self()?;
+        unsafe { result.init_self() }?;
         Ok(result)
     }
 
@@ -609,8 +605,8 @@ impl Storage {
     }
 
     unsafe fn restore_inner(storage: &mut Storage) -> Result<()> {
-        let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
-        let prefix = slice.align_to::<u64>().0;
+        let slice: &[u8] = unsafe { &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES] };
+        let prefix = unsafe { slice.align_to::<u64>().0 };
         if !prefix.is_empty() {
             return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
         }

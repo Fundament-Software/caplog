@@ -10,7 +10,7 @@ use crate::caplog::{CapLog, MAX_BUFFER_SIZE};
 use capnp::any_pointer;
 use hashed_array_trie::HashedArrayTrie;
 use hashed_array_trie::Storage;
-use rand::thread_rng;
+use rand::rng;
 use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
@@ -111,7 +111,7 @@ fn raw_trie_benchmark(start: SystemTime) {
     let storage = Rc::new(RefCell::new(Storage::new(Path::new("output.txt"), 32).unwrap()));
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let mut track: Vec<u128> = Vec::new();
 
     // Fill trie with random noise

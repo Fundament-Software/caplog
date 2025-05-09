@@ -1,7 +1,7 @@
 [package]
 name = "caplog"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,11 +15,11 @@ color-eyre = "0.6"
 eyre = "0.6"
 tokio = { version = "1.40", features = ["rt"] }
 thiserror = "2.0"
-bitfield-struct = "0.8"
+bitfield-struct = "0.11"
 memmap2 = "0.9"
 num = { version = "0.4.1", features = ["std"] }
 # quicklz = "0.3"
-rand = "0.8.5"
+rand = "0.9"
 tempfile = "3"
 
 [build-dependencies]
@@ -27,7 +27,7 @@ capstone-gen = { git = "https://github.com/Fundament-Software/capstone-rs" }
 
 [dev-dependencies]
 murmur3 = "0.5.1"
-rand = "0.8.5"
+rand = "0.9"
 tempfile = "3"
 futures = "0.3.30"
 cargo-husky = { version = "1.5.0", features = ["run-cargo-fmt"] }
