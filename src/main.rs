@@ -1,28 +1,11 @@
-mod caplog;
-mod hashed_array_trie;
-mod logsink;
-mod logsource;
-pub mod murmur3;
-mod offset_io;
-mod ring_buf_writer;
-pub mod sorted_map;
-use crate::caplog::{CapLog, MAX_BUFFER_SIZE};
+use caplog::MAX_BUFFER_SIZE;
+use caplog::hashed_array_trie::{self, HashedArrayTrie, Storage};
+use caplog::{CapLog, log_capnp::log_entry};
 use capnp::any_pointer;
-use hashed_array_trie::HashedArrayTrie;
-use hashed_array_trie::Storage;
-use rand::rng;
 use std::cell::RefCell;
 use std::io::Write;
-use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::SystemTime;
-#[cfg(miri)]
-mod fakefile;
-
-pub mod log_capnp {
-    include!(concat!(env!("OUT_DIR"), "/log_capnp.rs"));
-}
+use std::{path::Path, sync::Arc, time::SystemTime};
 
 #[allow(dead_code)]
 #[inline]
@@ -43,8 +26,6 @@ fn gen_anypointer_message(index: u64, anypointer: ::capnp::any_pointer::Builder)
     builder.set_schema(index * 10 + 8);
     builder
 }
-
-use crate::log_capnp::log_entry;
 
 // This benchmark bypasses capnproto's message processing so we can benchmark just the log itself.
 fn raw_log_benchmark(start: SystemTime) -> eyre::Result<()> {
@@ -111,7 +92,7 @@ fn raw_trie_benchmark(start: SystemTime) {
     let storage = Rc::new(RefCell::new(Storage::new(Path::new("output.txt"), 32).unwrap()));
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
-    let mut rng = rng();
+    let mut rng = rand::rng();
     let mut track: Vec<u128> = Vec::new();
 
     // Fill trie with random noise
