@@ -126,7 +126,7 @@ dependencies = [
 [[package]]
 name = "capstone"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#d34b307ad95b1ab9adafd387f0e70f357d4de81b"
+source = "git+https://github.com/Fundament-Software/capstone-rs#0affe2a72be7d24f7018d397ff96610c4b0666f2"
 dependencies = [
  "embedded-io",
  "flurry",
@@ -136,7 +136,7 @@ dependencies = [
 [[package]]
 name = "capstone-futures"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#d34b307ad95b1ab9adafd387f0e70f357d4de81b"
+source = "git+https://github.com/Fundament-Software/capstone-rs#0affe2a72be7d24f7018d397ff96610c4b0666f2"
 dependencies = [
  "capstone",
  "futures-util",
@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "capstone-gen"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#d34b307ad95b1ab9adafd387f0e70f357d4de81b"
+source = "git+https://github.com/Fundament-Software/capstone-rs#0affe2a72be7d24f7018d397ff96610c4b0666f2"
 dependencies = [
  "capnp-sys",
  "capstone",
@@ -159,7 +159,7 @@ dependencies = [
 [[package]]
 name = "capstone-macros"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#d34b307ad95b1ab9adafd387f0e70f357d4de81b"
+source = "git+https://github.com/Fundament-Software/capstone-rs#0affe2a72be7d24f7018d397ff96610c4b0666f2"
 dependencies = [
  "capstone",
  "capstone-gen",
@@ -173,7 +173,7 @@ dependencies = [
 [[package]]
 name = "capstone-rpc"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#d34b307ad95b1ab9adafd387f0e70f357d4de81b"
+source = "git+https://github.com/Fundament-Software/capstone-rs#0affe2a72be7d24f7018d397ff96610c4b0666f2"
 dependencies = [
  "capstone",
  "capstone-futures",
@@ -190,9 +190,9 @@ checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "cc"
-version = "1.2.29"
+version = "1.2.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c1599538de2394445747c8cf7935946e3cc27e9625f889d979bfb2aaf569362"
+checksum = "deec109607ca693028562ed836a5f1c4b8bd77755c4e132fc5ce11b0b6211ae7"
 dependencies = [
  "shlex",
 ]
