@@ -5,6 +5,7 @@ use super::log_capnp::log_sink;
 #[cfg(test)]
 use capnp::any_pointer;
 use capnp_macros::capnproto_rpc;
+use capnp_rpc::tokio;
 use core::future::Future;
 use std::cell::RefCell;
 use std::pin::Pin;
