@@ -13,7 +13,6 @@ capstone-rpc = { git = "https://github.com/Fundament-Software/capstone-rs" }
 capstone-macros = { git = "https://github.com/Fundament-Software/capstone-rs" }
 color-eyre = "0.6"
 eyre = "0.6"
-tokio = { version = "1.40", features = ["rt"] }
 thiserror = "2.0"
 bitfield-struct = "0.11"
 memmap2 = "0.9"

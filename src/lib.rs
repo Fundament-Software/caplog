@@ -4,6 +4,9 @@ pub use crate::caplog::Error;
 pub use crate::caplog::MAX_BUFFER_SIZE;
 pub use crate::caplog::MAX_FILE_SIZE;
 pub use crate::caplog::MAX_OPEN_FILES;
+pub use capnp;
+pub use capnp_futures;
+pub use capnp_rpc;
 
 mod logsink;
 mod logsource;
