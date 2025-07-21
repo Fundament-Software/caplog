@@ -1200,8 +1200,6 @@ impl Drop for Storage {
 
 #[cfg(test)]
 use rand::seq::SliceRandom;
-#[cfg(test)]
-use rand::thread_rng;
 #[cfg(not(miri))]
 #[cfg(test)]
 use tempfile::tempfile;
@@ -1432,7 +1430,7 @@ fn test_fill_trie() -> Result<()> {
     let mut v: Vec<u8> = (0..=MAX_COUNT).collect();
 
     //let mut rng = StdRng::seed_from_u64(42);
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     v.shuffle(&mut rng);
     for i in &v {
         trie.insert(*i, *i as u64).expect("Insertion failure!");
@@ -1490,7 +1488,7 @@ fn test_fill_random() -> Result<()> {
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
-    let mut rng = thread_rng();
+    let mut rng = rand::rng();
     let mut track: Vec<u128> = Vec::new();
 
     #[cfg(not(miri))]
@@ -1614,7 +1612,7 @@ fn test_storage_restore() -> Result<()> {
         let mut v: Vec<u8> = (0..=u8::MAX).collect();
 
         //let mut rng = StdRng::seed_from_u64(42);
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         v.shuffle(&mut rng);
         for i in &v {
             trie.insert(*i, *i as u64).expect("Insertion failure!");
