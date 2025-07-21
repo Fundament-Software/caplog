@@ -1,6 +1,6 @@
 // Based on the fastmurmur3 crate, but modified to work on an aligned u64 buffer
 
-use num::Integer;
+use num::{Integer, Zero};
 
 #[inline]
 pub fn murmur3_aligned_inner(mut data: &[u64], seed: u128, accumulator: usize) -> u128 {
@@ -68,6 +68,30 @@ pub fn murmur3_aligned(data: &[u64], seed: u128) -> u128 {
     murmur3_finalize(data.len(), murmur3_aligned_inner(data, seed, 0))
 }
 
+#[inline]
+pub fn murmur3_unaligned(data: &[u8], mut seed: u128) -> u128 {
+    let (prefix, align, suffix) = unsafe { data.align_to::<u64>() };
+    let mut acc = 0;
+    if !prefix.len().is_zero() {
+        let mut first = [0_u8; 8];
+        first[0..(8 - prefix.len())].copy_from_slice(prefix);
+        seed = unsafe { murmur3_aligned_inner(&mem::transmute::<[u8; 8], [u64; 1]>(first), seed, 0) };
+        acc += 1;
+    }
+
+    seed = murmur3_aligned_inner(align, seed, acc);
+    acc += align.len();
+
+    if !suffix.len().is_zero() {
+        let mut last = [0_u8; 8];
+        last[0..suffix.len()].copy_from_slice(suffix);
+        seed = unsafe { murmur3_aligned_inner(&mem::transmute::<[u8; 8], [u64; 1]>(last), seed, 0) };
+        acc += 1;
+    }
+
+    murmur3_finalize(acc, seed)
+}
+
 trait XorShift {
     fn xor_shr(&self, shift: u32) -> Self;
 }
@@ -89,6 +113,7 @@ fn fmix64(k: u64) -> u64 {
 use std::fmt::Write;
 #[cfg(test)]
 use std::io::Cursor;
+use std::mem;
 
 #[cfg(test)]
 mod test {
@@ -139,7 +164,7 @@ mod test {
 
     #[test]
     fn test_agreement_fuzzed() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         #[cfg(miri)]
         const MAXCOUNT: usize = 10;
@@ -165,6 +190,23 @@ mod test {
                     s
                 }),
             );
+        }
+    }
+
+    #[test]
+    fn test_unaligned() {
+        let mut rng = rand::rng();
+        let salt: u32 = rng.random();
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        for i in 1..=5 {
+            let a = murmur3_aligned(&aligned[0..i], salt as u128);
+            let b = murmur3_unaligned(&SOURCE[0..i * 8], salt as u128);
+            assert_eq!(a, b);
+        }
+
+        for i in 0..40 {
+            let a = murmur3_unaligned(&SOURCE[0..i], salt as u128);
+            assert_ne!(a, 0)
         }
     }
 }
