@@ -120,29 +120,32 @@ mod test {
     use super::*;
     use rand::{Rng, RngCore};
 
-    static SOURCE: &[u8; 40] = b"The quick brown fox jumps over the lazy ";
+    #[repr(align(8))]
+    struct ALIGNED([u8; 40]);
+
+    static SOURCE: ALIGNED = ALIGNED(*b"The quick brown fox jumps over the lazy ");
 
     #[test]
     fn test_agreement_basic() {
-        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(SOURCE.0) };
         let a = murmur3_aligned(&aligned, 0);
-        let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE.0), 0).unwrap();
         assert_eq!(a, b);
 
         let a = murmur3_aligned(&aligned, 12345 | 12345_u128 << 64);
-        let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 12345).unwrap();
+        let b = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE.0), 12345).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_agreement_split() {
-        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(SOURCE.0) };
         let a1 = murmur3_aligned_inner(&aligned[0..2], 0, 0);
         let a2 = murmur3_aligned_inner(&aligned[2..], a1, 2);
         let a = murmur3_finalize(aligned.len(), a2);
         let b = murmur3_aligned(&aligned, 0);
 
-        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE.0), 0).unwrap();
         assert_eq!(b, c);
 
         assert_eq!(a, b);
@@ -150,13 +153,13 @@ mod test {
 
     #[test]
     fn test_agreement_odd_split() {
-        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(SOURCE.0) };
         let a1 = murmur3_aligned_inner(&aligned[0..3], 0, 0);
         let a2 = murmur3_aligned_inner(&aligned[3..], a1, 3);
         let a = murmur3_finalize(aligned.len(), a2);
         let b = murmur3_aligned(&aligned, 0);
 
-        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE), 0).unwrap();
+        let c = murmur3::murmur3_x64_128(&mut Cursor::new(SOURCE.0), 0).unwrap();
         assert_eq!(b, c);
 
         assert_eq!(a, b);
@@ -197,15 +200,15 @@ mod test {
     fn test_unaligned() {
         let mut rng = rand::rng();
         let salt: u32 = rng.random();
-        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(*SOURCE) };
+        let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(SOURCE.0) };
         for i in 1..=5 {
             let a = murmur3_aligned(&aligned[0..i], salt as u128);
-            let b = murmur3_unaligned(&SOURCE[0..i * 8], salt as u128);
+            let b = murmur3_unaligned(&SOURCE.0[0..i * 8], salt as u128);
             assert_eq!(a, b);
         }
 
         for i in 0..40 {
-            let a = murmur3_unaligned(&SOURCE[0..i], salt as u128);
+            let a = murmur3_unaligned(&SOURCE.0[0..i], salt as u128);
             assert_ne!(a, 0)
         }
     }
