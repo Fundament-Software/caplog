@@ -335,11 +335,11 @@ where
 
 impl<W: ?Sized + OffsetWrite, const SIZE: usize> Drop for RingBufWriter<W, SIZE> {
     fn drop(&mut self) {
-        if let Ok((mut flusher, state)) = self.lock_flusher() {
-            if !flusher.panicked {
-                // dtors should not panic, so we ignore a failed flush
-                let _r = flusher.flush_buf::<SIZE>(state);
-            }
+        if let Ok((mut flusher, state)) = self.lock_flusher()
+            && !flusher.panicked
+        {
+            // dtors should not panic, so we ignore a failed flush
+            let _r = flusher.flush_buf::<SIZE>(state);
         }
     }
 }
