@@ -11,7 +11,7 @@ use std::{path::Path, sync::Arc, time::SystemTime};
 #[inline]
 fn get_next_u128<T>(rng: &mut T) -> u128
 where
-    T: rand::RngCore,
+    T: rand::Rng,
 {
     let mut bytes = [0u8; 16];
     rng.fill_bytes(&mut bytes);

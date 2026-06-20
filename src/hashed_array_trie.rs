@@ -1208,7 +1208,7 @@ use tempfile::tempfile;
 #[inline]
 fn get_next_u128<T>(rng: &mut T) -> u128
 where
-    T: rand::RngCore,
+    T: rand::Rng,
 {
     (rng.next_u64() as u128) | rng.next_u64() as u128
 }
