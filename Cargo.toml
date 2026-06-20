@@ -14,11 +14,11 @@ capstone-macros = { git = "https://github.com/Fundament-Software/capstone-rs" }
 color-eyre = "0.6"
 eyre = "0.6"
 thiserror = "2.0"
-bitfield-struct = "0.11"
+bitfield-struct = "0.13"
 memmap2 = "0.9"
 num = { version = "0.4.1", features = ["std"] }
 # quicklz = "0.3"
-rand = "0.9"
+rand = "0.10"
 tempfile = "3"
 
 [build-dependencies]
@@ -26,7 +26,7 @@ capstone-gen = { git = "https://github.com/Fundament-Software/capstone-rs" }
 
 [dev-dependencies]
 murmur3 = "0.5.1"
-rand = "0.9"
+rand = "0.10"
 tempfile = "3"
 futures = "0.3.30"
 cargo-husky = { version = "1.5.0", features = ["run-cargo-fmt"] }
