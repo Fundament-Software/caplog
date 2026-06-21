@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     
     - name: Install Rust
       run: rustup update ${{ matrix.rust }} --no-self-update && rustup default ${{ matrix.rust }}
@@ -30,9 +30,9 @@ jobs:
       run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt update
-          sudo apt install -y clang-15
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-15 60
-          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-15 60
+          sudo apt install -y clang-20
+          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-20 60
+          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-20 60
           
     - name: Build
       run: cargo build --all
@@ -50,7 +50,7 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - name: Build
       run: cargo build --workspace --all --verbose
     - name: Run tests
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -76,9 +76,9 @@ jobs:
         run: |
             export DEBIAN_FRONTEND=noninteractive
             sudo apt update
-            sudo apt install -y clang-15
-            sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-15 60
-            sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-15 60
+            sudo apt install -y clang-20
+            sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-20 60
+            sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang-20 60
 
       - name: Test default features
         run: cargo miri test --all
@@ -87,7 +87,7 @@ jobs:
     name: formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -102,7 +102,7 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - uses: EmbarkStudios/cargo-deny-action@v2
       with:
         log-level: warn
