@@ -167,7 +167,7 @@ mod test {
 
     #[test]
     fn test_agreement_fuzzed() {
-        use rand::RngExt;
+        use rand::RngCore;
         let mut rng = rand::rng();
 
         #[cfg(miri)]
@@ -199,7 +199,7 @@ mod test {
 
     #[test]
     fn test_unaligned() {
-        use rand::RngExt;
+        //use rand::RngExt;
         let mut rng = rand::rng();
         let salt: u32 = rng.random();
         let aligned = unsafe { std::mem::transmute::<[u8; 40], [u64; 5]>(SOURCE.0) };
