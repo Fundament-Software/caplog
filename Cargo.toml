@@ -8,8 +8,6 @@ license = "Apache-2.0"
 
 [dependencies]
 capstone = { git = "https://github.com/Fundament-Software/capstone-rs" }
-capstone-futures = { git = "https://github.com/Fundament-Software/capstone-rs" }
-capstone-rpc = { git = "https://github.com/Fundament-Software/capstone-rs" }
 capstone-macros = { git = "https://github.com/Fundament-Software/capstone-rs" }
 color-eyre = "0.6"
 eyre = "0.6"
@@ -18,7 +16,7 @@ bitfield-struct = "0.13"
 memmap2 = "0.9"
 num = { version = "0.4.1", features = ["std"] }
 # quicklz = "0.3"
-rand = "0.9"
+rand = "0.10.2"
 tempfile = "3"
 
 [build-dependencies]
@@ -26,16 +24,16 @@ capstone-gen = { git = "https://github.com/Fundament-Software/capstone-rs" }
 
 [dev-dependencies]
 murmur3 = "0.5.1"
-rand = "0.9"
+rand = "0.10.2"
 tempfile = "3"
-futures = "0.3.30"
+futures-util = "0.3.33"
 cargo-husky = { version = "1.5.0", features = ["run-cargo-fmt"] }
+capstone-rpc = { git = "https://github.com/Fundament-Software/capstone-rs" }
 
 [lints.clippy]
 type_complexity = "allow"
 
 #[patch."https://github.com/Fundament-Software/capstone-rs"]
 #capstone = { path = "../capstone-rs/capnp" }
-#capstone-futures = { path = "../capstone-rs/capnp-futures" }
 #capstone-rpc = { path = "../capstone-rs/capnp-rpc" }
 #capstone-macros = { path = "../capstone-rs/capnp-macros" }
