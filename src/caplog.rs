@@ -7,6 +7,7 @@ use super::hashed_array_trie::{self, HashedArrayTrie, Storage};
 
 use super::sorted_map::SortedMap;
 use capnp::message::{self, ReaderOptions, TypedReader};
+use capnp::traits::ImbueMut;
 use eyre::Result;
 use eyre::eyre;
 use std::alloc;
@@ -288,27 +289,37 @@ pub struct CapLog<const BUFFER_SIZE: usize> {
 }
 
 unsafe impl capnp::message::Allocator for StagingAlloc {
-    fn allocate_segment(&mut self, minimum_size: u32) -> (*mut u8, u32) {
+    fn allocate_segment(&mut self, minimum_size: u32) -> (std::ptr::NonNull<u8>, u32) {
         if self.staging_used || minimum_size as usize > self.staging.len() {
             let layout = alloc::Layout::from_size_align(minimum_size as usize * size_of::<u64>(), 8).unwrap();
-            unsafe { (alloc::alloc_zeroed(layout), minimum_size) }
+            unsafe {
+                (
+                    std::ptr::NonNull::new_unchecked(alloc::alloc_zeroed(layout)),
+                    minimum_size,
+                )
+            }
         } else {
             self.staging_used = true;
-            (self.staging.as_mut_ptr() as *mut u8, self.staging.len() as u32)
+            unsafe {
+                (
+                    std::ptr::NonNull::new_unchecked(self.staging.as_mut_ptr() as *mut u8),
+                    self.staging.len() as u32,
+                )
+            }
         }
     }
 
-    unsafe fn deallocate_segment(&mut self, ptr: *mut u8, word_size: u32, words_used: u32) {
-        let slice = unsafe { &*std::ptr::slice_from_raw_parts(ptr as *const u64, words_used as usize) };
+    unsafe fn deallocate_segment(&mut self, ptr: std::ptr::NonNull<u8>, word_size: u32, words_used: u32) {
+        let slice = unsafe { &*std::ptr::slice_from_raw_parts(ptr.as_ptr() as *const u64, words_used as usize) };
         self.hash = murmur3_aligned_inner(slice, self.hash, self.hash_len);
         self.hash_len += slice.len();
-        if self.staging.as_ptr() as *const u8 == ptr {
+        if self.staging.as_ptr() as *const u8 == ptr.as_ptr() {
             self.staging[..words_used as usize].fill(0);
             self.staging_used = false;
         } else {
             unsafe {
                 alloc::dealloc(
-                    ptr,
+                    ptr.as_ptr(),
                     alloc::Layout::from_size_align(word_size as usize * size_of::<u64>(), 8).unwrap(),
                 );
             }
@@ -634,6 +645,8 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         builder.set_machine_id(machine);
         builder.set_instance_id(instance);
         builder.set_schema(schema);
+        let mut caps = Vec::new();
+        builder.imbue_mut(&mut caps);
         builder.get_payload().set_as(payload)?;
 
         if id < self.current_id {
