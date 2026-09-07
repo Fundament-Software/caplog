@@ -100,7 +100,7 @@ dependencies = [
 [[package]]
 name = "capnp-sys"
 version = "1.3.0"
-source = "git+https://github.com/Fundament-Software/capstone#92377ba117bc042ba95f4414d56c2d2c580dd8bb"
+source = "git+https://github.com/Fundament-Software/capstone#be833696fa6199b0abf3b79d387a08eba86f5c65"
 dependencies = [
  "cc",
  "cxx",
@@ -112,7 +112,7 @@ dependencies = [
 [[package]]
 name = "capstone"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#0e5fee08613179ad0f47157f2be98b7bb478ae47"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6a4a0a9d27a76ea83ce639d29131feb77e46cc79"
 dependencies = [
  "embedded-io",
  "papaya",
@@ -123,7 +123,7 @@ dependencies = [
 [[package]]
 name = "capstone-futures"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#0e5fee08613179ad0f47157f2be98b7bb478ae47"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6a4a0a9d27a76ea83ce639d29131feb77e46cc79"
 dependencies = [
  "capstone",
  "futures-channel",
@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "capstone-gen"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#0e5fee08613179ad0f47157f2be98b7bb478ae47"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6a4a0a9d27a76ea83ce639d29131feb77e46cc79"
 dependencies = [
  "capnp-sys",
  "capstone",
@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "capstone-macros"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#0e5fee08613179ad0f47157f2be98b7bb478ae47"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6a4a0a9d27a76ea83ce639d29131feb77e46cc79"
 dependencies = [
  "capstone",
  "capstone-gen",
@@ -161,7 +161,7 @@ dependencies = [
 [[package]]
 name = "capstone-rpc"
 version = "0.18.0"
-source = "git+https://github.com/Fundament-Software/capstone-rs#0e5fee08613179ad0f47157f2be98b7bb478ae47"
+source = "git+https://github.com/Fundament-Software/capstone-rs#6a4a0a9d27a76ea83ce639d29131feb77e46cc79"
 dependencies = [
  "capstone",
  "capstone-futures",
@@ -522,7 +522,7 @@ dependencies = [
 [[package]]
 name = "kj-sys"
 version = "1.3.0"
-source = "git+https://github.com/Fundament-Software/capstone#92377ba117bc042ba95f4414d56c2d2c580dd8bb"
+source = "git+https://github.com/Fundament-Software/capstone#be833696fa6199b0abf3b79d387a08eba86f5c65"
 dependencies = [
  "cc",
  "cxx",
