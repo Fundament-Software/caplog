@@ -606,7 +606,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     #[inline]
     fn trie_insert(&mut self, id: u128, value: u64) -> Result<()> {
         while let Err(e) = self.trie.insert(id, value) {
-            match e.downcast::<hashed_array_trie::Error>()? {
+            match e {
                 hashed_array_trie::Error::OutOfMemory(_) => self.trie.storage.borrow_mut().resize(),
                 err => Err(err.into()),
             }?;

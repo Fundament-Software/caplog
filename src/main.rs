@@ -100,7 +100,7 @@ fn raw_trie_benchmark(start: SystemTime) {
         let key = get_next_u128(&mut rng);
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
-            match e.downcast::<hashed_array_trie::Error>().unwrap() {
+            match e {
                 hashed_array_trie::Error::OutOfMemory(_) => storage.borrow_mut().resize(),
                 err => Err(err.into()),
             }

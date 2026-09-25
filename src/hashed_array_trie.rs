@@ -44,6 +44,8 @@ pub enum Error {
     OutOfMemory(usize),
     #[error("unknown HashedArrayTrie error")]
     Unknown,
+    #[error("Can't delete shared node: {0}")]
+    Shared(u64),
 }
 
 #[bitfield(u64)]
@@ -120,124 +122,19 @@ impl Flags {
     }
 }
 
-#[test]
-fn test_offsets() {
-    let mut a = Flags::new().with_refcount(1);
-
-    assert_eq!(a.count(), 0);
-    assert!(!a.exists(0));
-    assert!(!a.exists(1));
-    assert!(!a.exists(31));
-    assert_eq!(a.offset(0), 0);
-    assert_eq!(a.offset(1), 0);
-    assert_eq!(a.offset(31), 0);
-
-    a.append(1);
-    assert_eq!(a.count(), 1);
-    assert!(!a.exists(0));
-    assert!(a.exists(1));
-    assert!(!a.exists(2));
-    assert!(!a.exists(31));
-    assert_eq!(a.offset(0), 0);
-    assert_eq!(a.offset(1), 0);
-    assert_eq!(a.offset(2), 1);
-    assert_eq!(a.offset(31), 1);
-
-    a.append(0);
-    assert_eq!(a.count(), 2);
-    assert!(a.exists(0));
-    assert!(a.exists(1));
-    assert!(!a.exists(2));
-    assert!(!a.exists(31));
-    assert_eq!(a.offset(0), 0);
-    assert_eq!(a.offset(1), 1);
-    assert_eq!(a.offset(2), 2);
-    assert_eq!(a.offset(31), 2);
-
-    a.append(31);
-    assert_eq!(a.count(), 3);
-    assert!(a.exists(0));
-    assert!(a.exists(1));
-    assert!(!a.exists(2));
-    assert!(a.exists(31));
-    assert_eq!(a.offset(0), 0);
-    assert_eq!(a.offset(1), 1);
-    assert_eq!(a.offset(2), 2);
-    assert_eq!(a.offset(31), 2);
-
-    a.append(2);
-    assert_eq!(a.count(), 4);
-    assert!(a.exists(0));
-    assert!(a.exists(1));
-    assert!(a.exists(2));
-    assert!(a.exists(31));
-    assert_eq!(a.offset(0), 0);
-    assert_eq!(a.offset(1), 1);
-    assert_eq!(a.offset(2), 2);
-    assert_eq!(a.offset(31), 3);
-
-    for i in 3..=30 {
-        a.append(i);
-    }
-
-    assert_eq!(a.count(), 32);
-
-    for i in 0..=31 {
-        assert!(a.exists(i));
-        assert_eq!(a.offset(i), i.into());
-    }
-}
-
-#[test]
-fn test_parity() {
-    let mut a = Flags::new().with_refcount(0);
-
-    assert_eq!(a.0, 0);
-    assert!(!a.get_parity());
-    assert_eq!(a.calc_parity(), 0);
-    assert!(a.check_parity());
-    a.set_parity();
-    assert_eq!(a.0, 0);
-    assert!(!a.get_parity());
-    assert_eq!(a.calc_parity(), 0);
-    assert!(a.check_parity());
-
-    a.set_refcount(1);
-    assert_ne!(a.0, 0);
-    assert!(!a.get_parity());
-    assert_eq!(a.calc_parity(), 1);
-    assert!(!a.check_parity());
-    a.set_parity();
-    assert!(a.get_parity());
-    assert_eq!(a.calc_parity(), 1);
-    assert!(a.check_parity());
-
-    a.0 = 0;
-    assert!(!a.get_parity());
-    a.set_skips(1);
-    assert!(!a.get_parity());
-    a.set_skips(4);
-    assert!(!a.get_parity());
-    a.set_skips(5);
-    assert!(a.get_parity());
-    a.set_skips(6);
-    assert!(!a.get_parity());
-    a.set_skips(7);
-    assert!(a.get_parity());
-    a.set_skips(1);
-    assert!(!a.get_parity());
-    a.set_skipbits(1 << 19);
-    assert!(a.get_parity());
-    a.set_skipbits(1 << 18);
-    assert!(!a.get_parity());
+pub enum NodeResult {
+    InPlace,
+    Moved(u64),
+    Copied(u64),
+    Err(Error),
 }
 
 #[derive(Debug)]
 #[repr(C)]
 struct Header {
-    freelist: [u64; 32], // Maintains a freelist for all 32 non-leaf node sizes
-    root: u64,           // This is the primary root
-    clean: u64,          // Only a 1 bit value but set to a u64 to ensure alignment
+    freelist: [u64; MAX_CHILDREN], // Maintains a freelist for all 32 non-leaf node sizes
+    root: u64,                     // This is the primary root
+    clean: u64,                    // Only a 1 bit value but set to a u64 to ensure alignment
 }
 
 #[derive(Debug)]
@@ -305,8 +202,10 @@ impl Storage {
 
         // Initialize our canary integer at offset 0, which is always invalid.
         slice[0] = u64::MAX;
-        // Initialize the root node as empty
-        slice[1] = Flags::new().with_refcount(1).into();
+        // Initialize the root node as empty, ensuring the parity bit is set
+        let mut root = Flags::new().with_refcount(1);
+        root.set_parity();
+        slice[1] = root.into();
 
         {
             let (header, _) = self.parts_mut();
@@ -414,9 +313,9 @@ impl Storage {
         }
     }
 
-    pub fn allocate(&mut self, count: usize) -> Result<u64> {
+    pub fn allocate(&mut self, count: usize) -> Result<u64, Error> {
         assert!(count > 0);
-        assert!(count <= 32);
+        assert!(count <= MAX_CHILDREN);
         if self.mapping.is_some() {
             let (header, words) = self.parts_mut();
             let freelist = &mut header.freelist;
@@ -560,9 +459,9 @@ impl Storage {
             // Check children for consistency. Remove any that have been corrupted.
             let mut count = 0;
             let mut valid_children = 0;
-            let mut children = [0; 32];
+            let mut children = [0; MAX_CHILDREN];
             let mut mask = node.mask();
-            for i in 0..32 {
+            for i in 0..MAX_CHILDREN {
                 if (mask & (1 << i)) != 0 {
                     if Self::scan_valid_nodes(words[offset + 1 + count], words, valid) {
                         children[valid_children] = words[offset + 1 + count];
@@ -806,10 +705,11 @@ impl Storage {
 #[derive(Debug)]
 pub struct HashedArrayTrie<K>
 where
-    K: num::PrimInt,
+    K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
     pub storage: Rc<RefCell<Storage>>,
     offset: u64,
+    owner: bool,
     phantomkey: PhantomData<K>,
 }
 
@@ -818,32 +718,52 @@ where
     K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
     pub fn new(storage: &Rc<RefCell<Storage>>, root: u64) -> HashedArrayTrie<K> {
+        {
+            let mut store = storage.borrow_mut();
+            let (header, words) = store.parts_mut();
+            assert_eq!(
+                root, header.root,
+                "new() opens the header's root; use duplicate() for other handles"
+            );
+            Self::add_ref(root as usize, words);
+        }
         HashedArrayTrie {
             storage: Rc::clone(storage),
             offset: root,
+            owner: true,
             phantomkey: PhantomData,
         }
     }
 
-    // DOES NOT INCREMENT REFCOUNTS. This is to enable the mutable fast-path, which will immediately delete the source
-    // node.
+    // Doesn't increment children refcounts, only valid when the prior node will be immediately deleted, hence being a "move"
     #[inline]
-    fn clone_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
-        // TODO: this uses memmove, these should never overlap so a copy is slightly faster but it might not matter for
+    fn move_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
+        // TODO: this uses memmove but these should never overlap so a copy is slightly faster but it might not matter for
         // small sizes
-        words.copy_within(from..(from + count + 1), to as usize)
+        words.copy_within(from..=(from + count), to as usize);
     }
 
-    // This fixes the refcounts of the children in a node cloned via clone_node. Doesn't check if it's a leaf node or
-    // not!
+    // Does a proper clone of a node, incrementing child refcounts if it isn't a leaf.
     #[inline]
-    fn fix_node_refcount(node: usize, words: &mut [u64]) {
-        let count = Flags::from_ref(&words[node]).count();
-        for i in (node + 1)..=(node + count) {
-            let flags = Flags::from_ref_mut(&mut words[words[i] as usize]);
-            flags.set_refcount(flags.refcount() + 1);
-            flags.set_parity();
+    fn clone_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
+        Self::move_node(from, to, count, words);
+        let f = Flags::from_ref_mut(&mut words[to as usize]);
+        f.set_refcount(1);
+        f.set_parity();
+
+        // If this isn't a leaf node, fixes the children's refcounts
+        if !Flags::from_ref_mut(&mut words[to as usize]).leaf() {
+            for i in (1 + to as usize)..=(count + to as usize) {
+                Self::add_ref(words[i] as usize, words);
+            }
         }
+    }
+
+    #[inline]
+    fn add_ref(node: usize, words: &mut [u64]) {
+        let flags = Flags::from_ref_mut(&mut words[node]);
+        flags.set_refcount(flags.refcount() + 1);
+        flags.set_parity();
     }
 
     #[inline]
@@ -892,74 +812,87 @@ where
         }
     }
 
-    fn delete_checked(offset: usize, bits: usize, header: &mut Header, words: &mut [u64], recurse: bool) -> Result<()> {
+    // Drops
+    fn release(offset: usize, header: &mut Header, words: &mut [u64]) -> Result<(), Error> {
         assert_ne!(words[offset], 0);
         assert_ne!(words[offset], u64::MAX);
-        let node = Flags::from_ref_mut(&mut words[offset]);
-
-        if node.refcount() <= 1 {
-            let mut count = node.count();
-            assert!(count <= 32); // popcount on a 32-bit integer shouldn't be greater than 32 or math is broken
-
-            if recurse {
-                // Decrement and (if necessary) delete any children we have, UNLESS we are a leaf node.
-                if bits > 5 {
-                    for i in 1..=count {
-                        Self::delete_checked(words[offset + i] as usize, bits - 5, header, words, true)?;
-                    }
+        // This performs a copy to avoid borrow problems
+        let node = *Flags::from_ref(&words[offset]);
+        if node.refcount() > 1 {
+            let f = Flags::from_ref_mut(&mut words[offset]);
+            f.set_refcount(f.refcount() - 1);
+            f.set_parity();
+            Ok(())
+        } else {
+            for i in 1..=node.count() {
+                if !node.leaf() {
+                    Self::release(words[offset + i] as usize, header, words)?;
                 }
             }
+            Self::free_block(offset, header, words)
+        }
+    }
 
-            // Set all words to zero
-            words[offset + 1..offset + 1 + count].fill(0);
+    fn free_block(offset: usize, header: &mut Header, words: &mut [u64]) -> Result<(), Error> {
+        let mut count = Flags::from_ref(&words[offset]).count();
+        words[offset + 1..offset + 1 + count].fill(0);
 
-            // After setting the known cells to zero, walk forward to see if there were any orphaned cells
-            while offset + 1 + count < words.len() && words[offset + 1 + count] == 0 {
-                count += 1;
-            }
-
-            // This should never happen unless something is corrupted
-            assert_ne!(count, 0);
-            if count == 0 {
-                return Err(Error::DirtyTrieState.into());
-            }
-
-            // Add it on to the appropriate freelist (0th index has 1 node, so  we use count - 1)
-            words[offset] = header.freelist[count - 1];
-            header.freelist[count - 1] = offset as u64;
-        } else {
-            node.set_refcount(node.refcount() - 1);
-            node.set_parity();
+        // After setting the known cells to zero, walk forward to see if there were any orphaned cells
+        while offset + 1 + count < words.len() && words[offset + 1 + count] == 0 {
+            count += 1;
         }
 
+        // This should never happen unless something is corrupted
+        assert_ne!(count, 0);
+        if count == 0 {
+            return Err(Error::DirtyTrieState.into());
+        }
+
+        // Add it to the appropriate freelist (0th index has 1 node, so  we use count - 1)
+        words[offset] = header.freelist[count - 1];
+        header.freelist[count - 1] = offset as u64;
         Ok(())
     }
 
-    fn insert_checked(
+    fn insert_entry(
         offset: usize,
         store: &mut RefMut<'_, Storage>,
         count: usize,
         index: u8,
         value: u64,
         mutable: bool,
-    ) -> Result<u64> {
-        if count == 32 {
+    ) -> NodeResult {
+        if count == MAX_CHILDREN {
             // This can only happen if the key already exists and somehow a previous check failed
-            return Err(Error::AlreadyExists(store.words()[offset + index as usize + 1]).into());
+            return NodeResult::Err(Error::AlreadyExists(store.words()[offset + index as usize + 1]).into());
         }
         // If we are mutable and we have space, we just append the child and return nothing
         if mutable && offset + count + 1 < store.words().len() && store.words()[offset + count + 1] == 0 {
             Self::append(offset, store.words_mut(), index, value, count);
-            Ok(0)
+            NodeResult::InPlace
         } else {
             // Otherwise, we must clone ourselves
-            let n = store.allocate(count + 1)?;
-            let words = store.words_mut();
-            Self::clone_node(offset, n, count, words);
+            let n = match store.allocate(count + 1) {
+                Ok(x) => x,
+                Err(e) => return NodeResult::Err(e),
+            };
+            let (header, words) = store.parts_mut();
 
-            // Then append to the clone, and return the clone
-            Self::append(n as usize, words, index, value, count);
-            Ok(n)
+            // If we have mutable access, just move
+            if mutable {
+                Self::move_node(offset, n, count, words);
+                Self::append(n as usize, words, index, value, count);
+                if let Err(e) = Self::free_block(offset, header, words) {
+                    NodeResult::Err(e)
+                } else {
+                    NodeResult::Moved(n)
+                }
+            } else {
+                // Otherwise, we have to copy
+                Self::clone_node(offset, n, count, words);
+                Self::append(n as usize, words, index, value, count);
+                NodeResult::Copied(n)
+            }
         }
     }
 
@@ -970,106 +903,154 @@ where
         key: K,
         value: u64,
         mutable: bool,
-    ) -> Result<u64> {
-        let node = Flags::from_ref_mut(&mut store.words_mut()[offset]);
-        let mutable = mutable && node.refcount() == 1;
+    ) -> NodeResult {
+        let node = *Flags::from_ref(&store.words()[offset]);
         let count = node.count();
-        if bits > 5 {
-            let index: u8 = key.shr(bits - 5).as_() & 0b11111;
 
-            // Check if the child exists already
-            if node.exists(index) {
-                // If it does exist, just recurse into it
-                let child_offset = offset + node.offset(index) + 1;
-                let child = store.words()[child_offset];
-                let n = Self::insert_node(child as usize, store, bits - 5, key, value, mutable)?;
-
-                // If it returns a new node, that means it replaced itself.
-                if n != 0 {
-                    if mutable {
-                        let (header, words) = store.parts_mut();
-                        // In this case, we can delete the old node without touching the refcounts of the new one
-                        Self::delete_checked(child as usize, bits - 5, header, words, false)?;
-
-                        // Then we point to the new node offset
-                        words[child_offset] = n;
-
-                        Ok(0)
-                    } else {
-                        // Otherwise, we have to properly increment the refcounts of the cloned node, then clone
-                        // ourselves
-                        let clone = store.allocate(count)?;
-                        let words = store.words_mut();
-                        if bits - 5 > 5 {
-                            Self::fix_node_refcount(n as usize, words);
-                        }
-
-                        Self::clone_node(offset, clone, count, words);
-                        let clone_node = Flags::from_ref(&words[clone as usize]);
-
-                        // Then we point our clone to the new node offset and return it
-                        words[clone as usize + clone_node.offset(index) + 1] = n;
-                        Ok(clone)
-                    }
-                } else {
-                    Ok(0)
-                }
-            } else {
-                // Create a new child node that is empty and recurse into it. We force it to be mutable, so it shouldn't
-                // return anything.
-                let child = store.allocate(1)?;
-                store.words_mut()[child as usize] = Flags::new().with_refcount(1).with_leaf(bits <= 10).into();
-                let n = Self::insert_node(child as usize, store, bits - 5, key, value, true)?;
-                assert_eq!(n, 0);
-
-                Self::insert_checked(offset, store, count, index, child, mutable)
-            }
-        } else {
+        //let mutable = mutable && node.refcount() == 1;
+        if bits <= 5 {
             let index: u8 = key.as_() & (0b11111 >> (5 - bits));
             // Check if the child exists already
-            if node.exists(index) {
-                let child_offset = node.offset(index);
-                let words = store.words();
-                Err(Error::AlreadyExists(words[offset + child_offset + 1]).into())
+            return if node.exists(index) {
+                NodeResult::Err(Error::AlreadyExists(store.words()[offset + node.offset(index) + 1]).into())
             } else {
-                Self::insert_checked(offset, store, count, index, value, mutable)
+                Self::insert_entry(offset, store, count, index, value, mutable)
+            };
+        }
+
+        let sbits = bits - 5;
+        let index: u8 = key.shr(sbits).as_() & 0b11111;
+
+        // Check if the child exists already
+        if !node.exists(index) {
+            // Create a new child node that is empty and recurse into it. We force it to be mutable, so it shouldn't
+            // return anything.
+            let child = match store.allocate(1) {
+                Ok(v) => v,
+                Err(e) => return NodeResult::Err(e),
+            };
+
+            // Setup new empty node
+            let mut fnew = Flags::new().with_refcount(1).with_leaf(bits <= 10);
+            fnew.set_parity();
+            store.words_mut()[child as usize] = fnew.into();
+
+            let n = match Self::insert_node(child as usize, store, bits - 5, key, value, true) {
+                NodeResult::InPlace => child,
+                NodeResult::Moved(n) => n,
+                NodeResult::Copied(_) => unreachable!("A new child should never need to be copied!"),
+                NodeResult::Err(e) => {
+                    Self::cleanup(child, store);
+                    return NodeResult::Err(e);
+                }
+            };
+
+            return match Self::insert_entry(offset, store, count, index, n, mutable) {
+                NodeResult::Err(e) => {
+                    Self::cleanup(n, store);
+                    NodeResult::Err(e)
+                }
+                x => x,
+            };
+        }
+
+        // If it does exist, just recurse into it
+        let child_offset = offset + node.offset(index) + 1;
+        let child = store.words()[child_offset];
+        let child_mutable = mutable && Flags::from_ref(&store.words()[child as usize]).refcount() == 1;
+
+        match Self::insert_node(child as usize, store, sbits, key, value, child_mutable) {
+            NodeResult::InPlace => NodeResult::InPlace,
+            NodeResult::Moved(n) => {
+                // Should have only happened if we are mutable
+                debug_assert!(mutable);
+                store.words_mut()[child_offset] = n;
+                NodeResult::InPlace
             }
+            NodeResult::Copied(n) if mutable => {
+                let (header, words) = store.parts_mut();
+                words[child_offset] = n;
+                if let Err(e) = Self::release(child as usize, header, words) {
+                    NodeResult::Err(e)
+                } else {
+                    NodeResult::InPlace
+                }
+            }
+            // If it was copied, we have to clone ourselves
+            NodeResult::Copied(n) => {
+                let clone = match store.allocate(count) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        Self::cleanup(n, store); // ITEM 5
+                        return NodeResult::Err(e);
+                    }
+                };
+
+                let (header, words) = store.parts_mut();
+                Self::clone_node(offset, clone, count, words);
+                words[clone as usize + (child_offset - offset)] = n;
+                if let Err(e) = Self::release(child as usize, header, words) {
+                    NodeResult::Err(e)
+                } else {
+                    NodeResult::Copied(clone)
+                }
+            }
+            x => x,
         }
     }
 
-    pub fn insert(&mut self, key: K, value: u64) -> Result<Option<HashedArrayTrie<K>>> {
-        let mut store = self.storage.borrow_mut();
+    // A particular reference either has one or two active refs depending on if it owns the file reference.
+    #[inline]
+    fn active_refs(&self) -> u8 {
+        1 + self.owner as u8
+    }
 
+    // Inserts a new key and value on an exclusive reference to a particular root - call duplicate() to clone
+    // a root.
+    pub fn insert(&mut self, key: K, value: u64) -> Result<(), Error> {
+        let mut store = self.storage.borrow_mut();
         let offset: usize = self.offset as usize;
         let bits = size_of::<K>() * 8;
-        let mutable = {
-            let (_, words) = store.parts();
-            let root = Flags::from_ref(&words[offset]);
-            root.refcount() <= 1
-        };
+        let mutable = Flags::from_ref(&store.words()[offset]).refcount() == self.active_refs();
 
-        let n = Self::insert_node(offset, &mut store, bits, key, value, mutable)?;
-        if n != 0 {
-            // We reacquire root here after the call so that Rust doesn't think we require two borrows at the same time
-            let (_, words) = store.parts_mut();
-            let root = Flags::from_ref(&words[offset]);
-            if root.refcount() > 1 {
-                Self::fix_node_refcount(n as usize, words);
-                return Ok(Some(HashedArrayTrie {
-                    storage: Rc::clone(&self.storage),
-                    offset: n,
-                    phantomkey: PhantomData,
-                }));
-            } else {
-                let index: u8 = key.shr(bits - 5).as_() & 0b11111;
-                Self::append(offset, words, index, n, root.count());
+        match Self::insert_node(offset, &mut store, bits, key, value, mutable) {
+            NodeResult::InPlace => Ok(()),
+            NodeResult::Moved(n) => {
+                if self.owner {
+                    store.parts_mut().0.root = n;
+                }
+                self.offset = n;
+                Ok(())
             }
+            NodeResult::Copied(n) => {
+                let (header, words) = store.parts_mut();
+                if self.owner {
+                    // Increment new reference before releasing the old one
+                    Self::add_ref(n as usize, words);
+                    header.root = n;
+                    Self::release(offset, header, words)?;
+                }
+                Self::release(offset, header, words)?;
+                self.offset = n;
+                Ok(())
+            }
+            NodeResult::Err(e) => Err(e),
         }
-
-        Ok(None)
     }
 
-    pub fn get(&self, key: K) -> Result<u64> {
+    // In the future, this will be a fallible clone
+    pub fn duplicate(&self) -> HashedArrayTrie<K> {
+        let mut store = self.storage.borrow_mut();
+        Self::add_ref(self.offset as usize, store.words_mut());
+        HashedArrayTrie {
+            storage: Rc::clone(&self.storage),
+            offset: self.offset,
+            owner: false,
+            phantomkey: PhantomData,
+        }
+    }
+
+    pub fn get(&self, key: K) -> Result<u64, Error> {
         let store = self.storage.borrow();
         let mut offset: usize = self.offset as usize;
         let mut bits = size_of::<K>() * 8;
@@ -1109,8 +1090,18 @@ where
         Ok(words[offset + node.offset(index) + 1])
     }
 
-    fn delete_node(offset: usize, store: &mut RefMut<'_, Storage>, bits: usize, key: K) -> Result<u64> {
+    fn delete_node(
+        offset: usize,
+        store: &mut RefMut<'_, Storage>,
+        bits: usize,
+        key: K,
+        held: u8,
+    ) -> Result<u64, Error> {
         let node = Flags::from_ref_mut(&mut store.words_mut()[offset]);
+        if node.refcount() > held {
+            return Err(Error::Shared(offset as u64));
+        }
+
         if bits > 5 {
             let index: u8 = key.shr(bits - 5).as_() & 0b11111;
 
@@ -1127,13 +1118,13 @@ where
             let child_offset = offset + node.offset(index) + 1;
             let count = node.count();
             let child = store.words()[child_offset] as usize;
-            let value = Self::delete_node(child, store, bits - 5, key)?;
+            let value = Self::delete_node(child, store, bits - 5, key, 1)?;
 
             if Flags::from_ref(&store.words()[child]).count() == 0 {
                 let (header, words) = store.parts_mut();
                 let check = Self::remove(offset, words, index, count);
                 assert_eq!(check, child as u64);
-                Self::delete_checked(child, bits - 5, header, words, true)?;
+                Self::release(child, header, words)?;
             }
 
             Ok(value)
@@ -1157,12 +1148,31 @@ where
         }
     }
 
-    pub fn delete(&mut self, key: K) -> Result<u64> {
+    pub fn delete(&mut self, key: K) -> Result<u64, Error> {
         let mut store = self.storage.borrow_mut();
 
         let offset: usize = self.offset as usize;
         let bits = size_of::<K>() * 8;
-        Self::delete_node(offset, &mut store, bits, key)
+        Self::delete_node(offset, &mut store, bits, key, self.active_refs())
+    }
+
+    #[inline]
+    fn cleanup(node: u64, store: &mut RefMut<'_, Storage>) {
+        let (header, words) = store.parts_mut();
+        let result = Self::release(node as usize, header, words);
+        debug_assert!(result.is_ok(), "cleanup failed for {node}");
+    }
+}
+
+impl<K> Drop for HashedArrayTrie<K>
+where
+    K: num::PrimInt + num::cast::AsPrimitive<u8>,
+{
+    fn drop(&mut self) {
+        let mut store = self.storage.borrow_mut();
+        let (header, words) = store.parts_mut();
+        let released = Self::release(self.offset as usize, header, words);
+        debug_assert!(released.is_ok(), "failed to release root {}", self.offset);
     }
 }
 
@@ -1196,6 +1206,118 @@ impl Drop for Storage {
             }
         }
     }
+}
+
+#[test]
+fn test_offsets() {
+    let mut a = Flags::new().with_refcount(1);
+
+    assert_eq!(a.count(), 0);
+    assert!(!a.exists(0));
+    assert!(!a.exists(1));
+    assert!(!a.exists(31));
+    assert_eq!(a.offset(0), 0);
+    assert_eq!(a.offset(1), 0);
+    assert_eq!(a.offset(31), 0);
+
+    a.append(1);
+    assert_eq!(a.count(), 1);
+    assert!(!a.exists(0));
+    assert!(a.exists(1));
+    assert!(!a.exists(2));
+    assert!(!a.exists(31));
+    assert_eq!(a.offset(0), 0);
+    assert_eq!(a.offset(1), 0);
+    assert_eq!(a.offset(2), 1);
+    assert_eq!(a.offset(31), 1);
+
+    a.append(0);
+    assert_eq!(a.count(), 2);
+    assert!(a.exists(0));
+    assert!(a.exists(1));
+    assert!(!a.exists(2));
+    assert!(!a.exists(31));
+    assert_eq!(a.offset(0), 0);
+    assert_eq!(a.offset(1), 1);
+    assert_eq!(a.offset(2), 2);
+    assert_eq!(a.offset(31), 2);
+
+    a.append(31);
+    assert_eq!(a.count(), 3);
+    assert!(a.exists(0));
+    assert!(a.exists(1));
+    assert!(!a.exists(2));
+    assert!(a.exists(31));
+    assert_eq!(a.offset(0), 0);
+    assert_eq!(a.offset(1), 1);
+    assert_eq!(a.offset(2), 2);
+    assert_eq!(a.offset(31), 2);
+
+    a.append(2);
+    assert_eq!(a.count(), 4);
+    assert!(a.exists(0));
+    assert!(a.exists(1));
+    assert!(a.exists(2));
+    assert!(a.exists(31));
+    assert_eq!(a.offset(0), 0);
+    assert_eq!(a.offset(1), 1);
+    assert_eq!(a.offset(2), 2);
+    assert_eq!(a.offset(31), 3);
+
+    for i in 3..=30 {
+        a.append(i);
+    }
+
+    assert_eq!(a.count(), MAX_CHILDREN);
+
+    for i in 0..=31 {
+        assert!(a.exists(i));
+        assert_eq!(a.offset(i), i.into());
+    }
+}
+
+#[test]
+fn test_parity() {
+    let mut a = Flags::new().with_refcount(0);
+
+    assert_eq!(a.0, 0);
+    assert!(!a.get_parity());
+    assert_eq!(a.calc_parity(), 0);
+    assert!(a.check_parity());
+    a.set_parity();
+    assert_eq!(a.0, 0);
+    assert!(!a.get_parity());
+    assert_eq!(a.calc_parity(), 0);
+    assert!(a.check_parity());
+
+    a.set_refcount(1);
+    assert_ne!(a.0, 0);
+    assert!(!a.get_parity());
+    assert_eq!(a.calc_parity(), 1);
+    assert!(!a.check_parity());
+    a.set_parity();
+    assert!(a.get_parity());
+    assert_eq!(a.calc_parity(), 1);
+    assert!(a.check_parity());
+
+    a.0 = 0;
+    assert!(!a.get_parity());
+    a.set_skips(1);
+    assert!(!a.get_parity());
+    a.set_skips(4);
+    assert!(!a.get_parity());
+    a.set_skips(5);
+    assert!(a.get_parity());
+    a.set_skips(6);
+    assert!(!a.get_parity());
+    a.set_skips(7);
+    assert!(a.get_parity());
+    a.set_skips(1);
+    assert!(!a.get_parity());
+    a.set_skipbits(1 << 19);
+    assert!(a.get_parity());
+    a.set_skipbits(1 << 18);
+    assert!(!a.get_parity());
 }
 
 #[cfg(test)]
@@ -1238,7 +1360,7 @@ fn test_out_of_storage() -> Result<()> {
 
     store.allocate(1)?;
     let e = store.allocate(32).expect_err("Should have run out of memory?!");
-    assert_eq!(e.downcast::<Error>().unwrap(), Error::OutOfMemory(576));
+    assert_eq!(e, Error::OutOfMemory(576));
     Ok(())
 }
 
@@ -1251,7 +1373,7 @@ fn test_storage_allocate() -> Result<()> {
 
     for i in 1..=32 {
         while let Err(e) = store.allocate(i) {
-            match e.downcast::<Error>().unwrap() {
+            match e {
                 Error::OutOfMemory(_) => store.resize(),
                 err => Err(err.into()),
             }?;
@@ -1275,7 +1397,7 @@ fn test_storage_load() -> Result<()> {
         let mut store = Storage::load_file(fileref)?;
         for i in 1..=32 {
             while let Err(e) = store.allocate(i) {
-                match e.downcast::<Error>().unwrap() {
+                match e {
                     Error::OutOfMemory(_) => store.resize(),
                     err => Err(err.into()),
                 }?;
@@ -1324,7 +1446,7 @@ fn test_duplicate() -> Result<()> {
     trie.insert(1, 1)?;
     assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     let e = trie.insert(1, 2).expect_err("Should have been an error!");
-    assert_eq!(e.downcast::<Error>().unwrap(), Error::AlreadyExists(1));
+    assert_eq!(e, Error::AlreadyExists(1));
     assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     Ok(())
 }
@@ -1342,7 +1464,7 @@ fn test_delete() -> Result<()> {
     assert_eq!(trie.delete(1).expect("Failed to delete key"), 1);
     let e = trie.get(1).expect_err("Should have been an error!");
     assert_eq!(
-        e.downcast::<Error>().unwrap(),
+        e,
         Error::NotFound {
             key_bits: 0, // This should fail immediately, due to the root being empty
             key_offset: 16,
@@ -1501,7 +1623,7 @@ fn test_fill_random() -> Result<()> {
         let key = get_next_u128(&mut rng);
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
-            match e.downcast::<Error>().unwrap() {
+            match e {
                 Error::OutOfMemory(_) => storage.borrow_mut().resize(),
                 err => Err(err.into()),
             }?;
@@ -1565,7 +1687,7 @@ fn test_allocations() -> Result<()> {
 
         for i in 0..=255 {
             while let Err(e) = trie.insert(i, i as u64) {
-                match e.downcast::<Error>().unwrap() {
+                match e {
                     Error::OutOfMemory(_) => storage.borrow_mut().resize(),
                     err => Err(err.into()),
                 }?;
