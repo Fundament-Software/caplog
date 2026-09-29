@@ -4,8 +4,7 @@ use bitfield_struct::bitfield;
 use eyre::Result;
 #[cfg(not(miri))]
 use memmap2::MmapMut;
-use std::cell::RefCell;
-use std::cell::RefMut;
+use portable_atomic::AtomicU128;
 use std::collections::HashSet;
 use std::fs::File;
 #[cfg(not(miri))]
@@ -14,7 +13,12 @@ use std::marker::PhantomData;
 use std::mem;
 use std::mem::size_of;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
+#[cfg(not(miri))]
+use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 const MAX_CHILDREN: usize = 32;
 const MAX_NODE_SIZE: usize = MAX_CHILDREN + 1;
@@ -46,23 +50,68 @@ pub enum Error {
     Unknown,
     #[error("Can't delete shared node: {0}")]
     Shared(u64),
+    #[error("file lock was poisoned, Trie may be in an inconsistent state")]
+    LockError,
+    #[error("Cannot increment reference counter beyond {0} without risking overflow")]
+    TooManyRefs(u64),
 }
 
 #[bitfield(u64)]
 struct Flags {
     #[bits(32)]
     mask: u32, // Each bit represents a child that exists, and the total number of children is the number of set bits
-    #[bits(1)]
-    leaf: bool,
     #[bits(8)]
     refcount: u8,
+    #[bits(1)]
+    leaf: bool,
     #[bits(3)]
     skips: u8, // Stores how many skip levels (0-4) we're using in this node
     #[bits(20)]
     skipbits: u32, // stores the skipped bits of the key
 }
 
+// Mask for the refcount field above - unfortunately #[bits()] won't accept a constant.
+const REFCOUNT_MASK: u64 = 0xFFu64 << 32;
+const REFCOUNT_ONE: u64 = 0x1 << 32;
+
+// We have to atomically load most nodes because we usually don't have exclusive access, and doing a non-atomic read on
+// two different threads is undefined behavior. However, when we are trying to modify a node, this means we must remember to
+// *write back* whatever we changed. This view ensures that happens on drop.
+struct FlagView<'a> {
+    word: &'a AtomicU64,
+    value: u64,
+}
+
+impl<'a> FlagView<'a> {
+    // We have to atomically load nodes because in multithreaded contexts, another thread could also be walking the tree
+    pub fn new(words: &'a [AtomicU64], offset: usize) -> Self {
+        let word = &words[offset];
+        Self {
+            word,
+            value: word.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn flags(&mut self) -> &mut Flags {
+        Flags::from_ref_mut(&mut self.value)
+    }
+}
+impl Drop for FlagView<'_> {
+    fn drop(&mut self) {
+        self.word.store(self.value, Ordering::Release);
+    }
+}
+
 impl Flags {
+    pub fn load(words: &[AtomicU64], offset: usize) -> Self {
+        Self(words[offset].load(Ordering::Acquire))
+    }
+
+    // If we have a mutable reference, we can directly write to it because no other thread has access.
+    pub fn from_ref_mut(target: &mut u64) -> &mut Flags {
+        unsafe { &mut *(target as *mut u64).cast::<Flags>() }
+    }
+
     pub fn offset(&self, index: u8) -> usize {
         (((self.0 & 0xFFFFFFFF) << (32 - index)) as u32).count_ones() as usize
     }
@@ -76,12 +125,6 @@ impl Flags {
         assert!(!self.exists(index));
         self.set_mask(self.mask() | (0b1 << index));
     }
-    pub fn from_ref_mut(target: &mut u64) -> &mut Flags {
-        unsafe { &mut *(target as *mut u64).cast::<Flags>() }
-    }
-    pub fn from_ref(target: &u64) -> &Flags {
-        unsafe { &*(target as *const u64).cast::<Flags>() }
-    }
 
     #[inline]
     fn parity_location(&self) -> u8 {
@@ -90,7 +133,8 @@ impl Flags {
     }
     #[inline]
     fn calc_parity(&self) -> u32 {
-        (self.0 & !(1 << self.parity_location())).count_ones() & 1
+        // Exclude refcount from parity calculation so we can atomically manage them
+        (self.0 & !(1 << self.parity_location()) & !REFCOUNT_MASK).count_ones() & 1
     }
     #[inline]
     fn get_parity(&self) -> bool {
@@ -132,99 +176,257 @@ pub enum NodeResult {
 #[derive(Debug)]
 #[repr(C)]
 struct Header {
-    freelist: [u64; MAX_CHILDREN], // Maintains a freelist for all 32 non-leaf node sizes
-    root: u64,                     // This is the primary root
-    clean: u64,                    // Only a 1 bit value but set to a u64 to ensure alignment
+    freelist: [AtomicU128; MAX_CHILDREN], // Maintains a freelist for all 32 non-leaf node sizes
+    root: AtomicU64,                      // This is the primary root
+    clean: AtomicU64,                     // Only a 1 bit value but set to a u64 to ensure alignment
+}
+
+impl Header {
+    pub(crate) fn tag(off: u64, tag: u64) -> u128 {
+        (tag as u128) << 64 | off as u128
+    }
+    pub(crate) fn untag(v: u128) -> (u64, u64) {
+        (v as u64, (v >> 64) as u64)
+    }
+
+    pub(crate) fn pop(head: &AtomicU128, words: &[AtomicU64]) -> Option<u64> {
+        let mut cur = head.load(Ordering::Acquire);
+        loop {
+            let (offset, tag) = Self::untag(cur);
+            if offset == u64::MAX {
+                // doesn't point to anything
+                return None;
+            }
+            let next = words[offset as usize].load(Ordering::Relaxed);
+            match head.compare_exchange_weak(
+                cur,
+                Self::tag(next, tag.wrapping_add(1)),
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(offset),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub(crate) fn push(head: &AtomicU128, words: &[AtomicU64], offset: u64) {
+        let mut cur = head.load(Ordering::Relaxed);
+        loop {
+            let (curoffset, tag) = Self::untag(cur);
+            words[offset as usize].store(curoffset, Ordering::Relaxed);
+            match head.compare_exchange_weak(
+                cur,
+                Self::tag(offset, tag.wrapping_add(1)),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Storage {
     handle: Option<File>,
     #[cfg(miri)]
-    mapping: Option<Vec<u8>>,
+    mapping: RwLock<Vec<u8>>,
     #[cfg(not(miri))]
-    mapping: Option<MmapMut>,
+    mapping: RwLock<MmapMut>,
     // TODO: Maybe replace with data structure that can maintain efficient merged intervals
     //dirty_pages: HashSet<usize>,
+}
+
+#[inline]
+fn add_ref(node: usize, words: &[AtomicU64]) -> u64 {
+    words[node].fetch_add(REFCOUNT_ONE, Ordering::Relaxed)
+}
+
+pub struct StorageView<'a>(RwLockReadGuard<'a, MmapMut>);
+
+pub struct StorageViewMut<'a>(std::sync::RwLockWriteGuard<'a, MmapMut>);
+
+impl StorageView<'_> {
+    #[inline]
+    fn parts(&self) -> (&Header, &[AtomicU64]) {
+        (self.header(), self.words())
+    }
+
+    #[inline]
+    fn words(&self) -> &[AtomicU64] {
+        // Build from a raw pointer because sharing slice references is undefined behavior and will make Miri angy
+        let p = unsafe { self.0.as_ptr().add(HEADER_BYTES) } as *const AtomicU64;
+        unsafe { std::slice::from_raw_parts(p, (self.0.len() - HEADER_BYTES) / 8) }
+    }
+
+    #[inline]
+    fn header(&self) -> &Header {
+        unsafe { &*(self.0.as_ptr() as *const Header) }
+    }
+
+    #[inline]
+    fn drop_ref(node: usize, w: &[AtomicU64]) -> bool {
+        let prev = w[node].fetch_sub(REFCOUNT_ONE, Ordering::Release);
+        if Flags::from(prev).refcount() == 1 {
+            // This fence is required because it makes all other decrements from other threads visible in this one.
+            std::sync::atomic::fence(Ordering::Acquire);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self, offset: usize) -> Result<(), Error> {
+        let words = self.words();
+        if !Self::drop_ref(offset, words) {
+            return Ok(());
+        }
+        let node = Flags::load(words, offset);
+
+        // Recurse into children
+        for i in 1..=node.count() {
+            if !node.leaf() {
+                self.release(words[offset + i].load(Ordering::Relaxed) as usize)?;
+            }
+        }
+        self.free_block(offset)
+    }
+
+    fn free_block(&self, offset: usize) -> Result<(), Error> {
+        let (header, words) = self.parts();
+        let mut count = Flags::load(words, offset).count();
+
+        // This has to be a loop because the atomic stores are mandatory, another thread could touch these while doing an orphan check
+        for i in offset + 1..offset + 1 + count {
+            words[i].store(0, Ordering::Release); // TODO: might be valid as Relaxed
+        }
+
+        // After setting the known cells to zero, walk forward to see if there were any orphaned cells
+        while offset + 1 + count < words.len() && words[offset + 1 + count].load(Ordering::Relaxed) == 0 {
+            count += 1;
+        }
+
+        // This should never happen unless something is corrupted
+        assert_ne!(count, 0);
+        if count == 0 {
+            return Err(Error::DirtyTrieState.into());
+        }
+
+        // Add it to the appropriate freelist (0th index has 1 node, so  we use count - 1)
+        Header::push(&header.freelist[count - 1], words, offset as u64);
+        Ok(())
+    }
+
+    pub fn allocate(&self, count: usize) -> Result<u64, Error> {
+        assert!(count > 0);
+        assert!(count <= MAX_CHILDREN);
+        let (header, words) = self.parts();
+        let freelist = &header.freelist;
+        for i in (count - 1)..MAX_CHILDREN {
+            let word = freelist[i].load(Ordering::Relaxed) as u64;
+            if word != u64::MAX {
+                let Some(result) = Header::pop(&freelist[i], words) else {
+                    continue;
+                };
+
+                // i is in terms of the index, which is the true size - 2 (MIN_NODE_SIZE), whereas count is the
+                // true size - 1. This is in true word size because we need at least 2 words to put in 1 node.
+                let remainder = (i + 2) - (count + 1);
+
+                // If we have more than MIN_NODE_SIZE leftover, assign it to different freelist instead of wasting it
+                if remainder >= MIN_NODE_SIZE {
+                    // However, now that remainder is in the true word size, we have to subtract MIN_NODE_SIZE
+                    // to get to the actual freelist index!
+                    Header::push(
+                        &header.freelist[remainder - MIN_NODE_SIZE],
+                        words,
+                        result + count as u64 + 1,
+                    );
+                }
+                return Ok(result);
+            }
+        }
+        Err(Error::OutOfMemory(self.0.len()).into())
+    }
+}
+
+impl StorageViewMut<'_> {
+    #[inline]
+    fn parts(&mut self) -> (&mut Header, &mut [u64]) {
+        let p = unsafe { self.0.as_mut_ptr().add(HEADER_BYTES) } as *mut AtomicU64;
+        let words = unsafe { std::slice::from_raw_parts_mut(p as *mut u64, (self.0.len() - HEADER_BYTES) / 8) };
+
+        (unsafe { &mut *(self.0.as_mut_ptr() as *mut Header) }, words)
+    }
+
+    #[inline]
+    fn words(&mut self) -> &mut [u64] {
+        let p = unsafe { self.0.as_mut_ptr().add(HEADER_BYTES) } as *mut AtomicU64;
+        unsafe { std::slice::from_raw_parts_mut(p as *mut u64, (self.0.len() - HEADER_BYTES) / 8) }
+    }
+
+    #[inline]
+    fn header(&mut self) -> &mut Header {
+        unsafe { &mut *(self.0.as_mut_ptr() as *mut Header) }
+    }
 }
 
 const HEADER_BYTES: usize = size_of::<Header>();
 
 impl Storage {
-    #[inline]
-    fn parts(&self) -> (&Header, &[u64]) {
-        unsafe {
-            let (header, slice) = self.mapping.as_ref().unwrap_unchecked().split_at(HEADER_BYTES);
-            (
-                &*(header.as_ptr() as *const Header),
-                std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len() / size_of::<u64>()),
-            )
-        }
+    pub fn view(&self) -> StorageView<'_> {
+        StorageView(self.mapping.read().unwrap())
     }
 
-    #[inline]
-    fn parts_mut(&mut self) -> (&mut Header, &mut [u64]) {
-        unsafe {
-            let (header, slice) = self.mapping.as_mut().unwrap_unchecked().split_at_mut(HEADER_BYTES);
-            (
-                &mut *(header.as_mut_ptr() as *mut Header),
-                std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u64, slice.len() / size_of::<u64>()),
-            )
-        }
-    }
-
-    #[inline]
-    fn words(&self) -> &[u64] {
-        unsafe {
-            let slice = &self.mapping.as_ref().unwrap_unchecked()[HEADER_BYTES..];
-            std::slice::from_raw_parts(slice.as_ptr() as *const u64, slice.len() / size_of::<u64>())
-        }
-    }
-
-    #[inline]
-    fn words_mut(&mut self) -> &mut [u64] {
-        unsafe {
-            let slice = &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..];
-            std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u64, slice.len() / size_of::<u64>())
-        }
+    pub fn view_mut(&mut self) -> StorageViewMut<'_> {
+        StorageViewMut(self.mapping.write().unwrap())
     }
 
     unsafe fn init_self(&mut self) -> Result<()> {
-        // We do this alignment check once, and the rest of the time we do the unguarded direct mutation.
-        let (prefix, slice, tail) =
-            unsafe { &mut self.mapping.as_mut().unwrap_unchecked()[HEADER_BYTES..].align_to_mut::<u64>() };
+        {
+            let mut map = self.mapping.write().map_err(|_| Error::LockError)?;
+            // We do this alignment check once, and the rest of the time we do the unguarded direct mutation.
+            let (prefix, slice, tail) = unsafe { &mut map[HEADER_BYTES..].align_to_mut::<u64>() };
 
-        if !prefix.is_empty() {
-            return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
-        } else if !tail.is_empty() {
-            return Err(Error::InvalidAlignment(size_of::<u64>(), tail.len()).into());
+            if !prefix.is_empty() {
+                return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            } else if !tail.is_empty() {
+                return Err(Error::InvalidAlignment(size_of::<u64>(), tail.len()).into());
+            }
+
+            // Initialize our canary integer at offset 0, which is always invalid.
+            slice[0] = u64::MAX;
+            // Initialize the root node as empty, ensuring the parity bit is set
+            let mut root = Flags::new().with_refcount(1);
+            root.set_parity();
+            slice[1] = root.into();
         }
 
-        // Initialize our canary integer at offset 0, which is always invalid.
-        slice[0] = u64::MAX;
-        // Initialize the root node as empty, ensuring the parity bit is set
-        let mut root = Flags::new().with_refcount(1);
-        root.set_parity();
-        slice[1] = root.into();
-
         {
-            let (header, _) = self.parts_mut();
+            let mut view = self.view_mut();
+            let header = view.header();
 
             // Initialize freelist and dirty clean value
-            header.freelist.fill(u64::MAX);
-            header.clean = 0;
-            header.root = 1;
+            header.freelist.iter_mut().for_each(|x| *x.get_mut() = u128::MAX);
+            *header.clean.get_mut() = 0;
+            *header.root.get_mut() = 1;
         }
 
         // If init section fails, we will leave a file full of zeros, which is okay because that's considered invalid
         // anyway.
-        self.init_section(HEADER_BYTES + MAX_NODE_BYTES + size_of::<u64>(), unsafe {
-            self.mapping.as_ref().unwrap_unchecked().len()
-        })?;
+
+        let map = self.mapping.get_mut().map_err(|_| Error::LockError)?;
+        let len = map.len();
+        Self::init_section(map, HEADER_BYTES + MAX_NODE_BYTES + size_of::<u64>(), len)?;
 
         // flush our clean value of 0 so we can detect if we aren't closed properly
         #[cfg(not(miri))]
-        unsafe { self.mapping.as_mut().unwrap_unchecked().flush_range(0, HEADER_BYTES) }?;
+        self.mapping
+            .write()
+            .map_err(|_| Error::LockError)?
+            .flush_range(0, HEADER_BYTES)?;
 
         Ok(())
     }
@@ -237,7 +439,7 @@ impl Storage {
 
         let mut result = Storage {
             handle,
-            mapping: Some(mapping),
+            mapping: mapping.into(),
             //dirty_pages: HashSet::new(),
         };
 
@@ -313,89 +515,48 @@ impl Storage {
         }
     }
 
-    pub fn allocate(&mut self, count: usize) -> Result<u64, Error> {
-        assert!(count > 0);
-        assert!(count <= MAX_CHILDREN);
-        if self.mapping.is_some() {
-            let (header, words) = self.parts_mut();
-            let freelist = &mut header.freelist;
-            for i in (count - 1)..MAX_CHILDREN {
-                if freelist[i] != u64::MAX {
-                    let result = freelist[i];
-                    freelist[i] = words[freelist[i] as usize];
-                    if freelist[i] != u64::MAX {
-                        assert!(freelist[i] as usize + i + 1 < words.len());
-                    }
-
-                    // If we have more than 1 extra space left over, assign it to different freelist instead of wasting
-                    // it
-                    if count < i {
-                        // i is in terms of the index, which is the true size - 2 (MIN_NODE_SIZE), whereas count is the
-                        // true size - 1
-                        let remainder = (i + 2) - (count + 1);
-                        // We express remainder in the true word size because we need at least 2 words to squeeze in 1
-                        // node (1 header + 1 data)
-                        if remainder >= MIN_NODE_SIZE {
-                            // However, now that remainder is in the true word size, we have to subtract MIN_NODE_SIZE
-                            // to get to the actual freelist index!
-                            let split_node = result as usize + count + 1;
-                            words[split_node] = freelist[remainder - MIN_NODE_SIZE];
-                            freelist[remainder - MIN_NODE_SIZE] = split_node as u64;
-                        }
-                    }
-                    return Ok(result);
-                }
-            }
-            Err(Error::OutOfMemory(self.mapping.as_ref().unwrap().len()).into())
-        } else {
-            Err(Error::OutOfMemory(0).into())
-        }
-    }
-
     // Initializes a new section at the given byte offset by adding it to the freelist. We do this in reverse order so
     // the freelist doesn't try to fill up the new section backwards.
-    fn init_section(&mut self, byte_offset: usize, byte_end: usize) -> Result<()> {
-        if let Some(mapping) = self.mapping.as_mut() {
-            unsafe {
-                let ptr = mapping.as_mut_ptr();
-                let unaligned: &mut [u8] = &mut mapping[byte_offset..byte_end];
-                let header = &mut *(ptr as *mut Header);
-                let (prefix, slice, _) = unaligned.align_to_mut::<u64>();
-                if !prefix.is_empty() {
-                    // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which
-                    // is very bad.
-                    return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
-                }
-
-                // First we get the head and add it to the proper freelist, if there is one
-                let mut word_offset = (byte_offset - HEADER_BYTES) / size_of::<u64>();
-                let headsize = slice.len() % MAX_NODE_SIZE;
-                let node_aligned = if headsize >= MIN_NODE_SIZE {
-                    slice[0] = header.freelist[headsize - MIN_NODE_SIZE];
-                    header.freelist[headsize - MIN_NODE_SIZE] = word_offset as u64;
-                    word_offset += headsize;
-                    &mut slice[headsize..]
-                } else {
-                    let count = slice.len();
-                    // 1 extra u64 isn't big enough to put in our freelists so we just ignore it
-                    &mut slice[..count - headsize]
-                };
-
-                assert_eq!(node_aligned.len() % MAX_NODE_SIZE, 0);
-
-                // Then we add the remaining max sized nodes to the freelist in reverse
-                for i in (0..node_aligned.len()).step_by(MAX_NODE_SIZE).rev() {
-                    node_aligned[i] = header.freelist[MAX_NODE_SIZE - MIN_NODE_SIZE];
-                    header.freelist[MAX_NODE_SIZE - MIN_NODE_SIZE] = (word_offset + i) as u64;
-                }
+    fn init_section(mapping: &mut MmapMut, byte_offset: usize, byte_end: usize) -> Result<()> {
+        unsafe {
+            let ptr = mapping.as_mut_ptr();
+            let unaligned: &mut [u8] = &mut mapping[byte_offset..byte_end];
+            let header = &mut *(ptr as *mut Header);
+            let (prefix, slice, _) = unaligned.align_to_mut::<u64>();
+            if !prefix.is_empty() {
+                // If this happens, then there is a high chance that self.mapping itself is not u64 aligned, which
+                // is very bad.
+                return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
             }
-            Ok(())
-        } else {
-            Err(Error::OutOfMemory(0).into())
+
+            // First we get the head and add it to the proper freelist, if there is one
+            let mut word_offset = (byte_offset - HEADER_BYTES) / size_of::<u64>();
+            let headsize = slice.len() % MAX_NODE_SIZE;
+            let node_aligned = if headsize >= MIN_NODE_SIZE {
+                let target = header.freelist[headsize - MIN_NODE_SIZE].get_mut();
+                slice[0] = *target as u64;
+                *target = Header::tag(word_offset as u64, 0);
+                word_offset += headsize;
+                &mut slice[headsize..]
+            } else {
+                let count = slice.len();
+                // 1 extra u64 isn't big enough to put in our freelists so we just ignore it
+                &mut slice[..count - headsize]
+            };
+
+            assert_eq!(node_aligned.len() % MAX_NODE_SIZE, 0);
+
+            // Then we add the remaining max sized nodes to the freelist in reverse
+            for i in (0..node_aligned.len()).step_by(MAX_NODE_SIZE).rev() {
+                let target = header.freelist[MAX_NODE_SIZE - MIN_NODE_SIZE].get_mut();
+                node_aligned[i] = *target as u64;
+                *target = Header::tag((word_offset + i) as u64, 0);
+            }
         }
+        Ok(())
     }
 
-    #[cfg(not(miri))]
+    //#[cfg(not(miri))]
     pub fn load_file(src: File) -> Result<Storage> {
         let fsize = src.metadata()?.len();
         if fsize < HEADER_BYTES as u64 {
@@ -408,28 +569,32 @@ impl Storage {
                 return Err(Error::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
             }
             let mut storage = Storage {
-                mapping: Some(mapping),
+                mapping: mapping.into(),
                 handle: Some(src),
                 //dirty_pages: HashSet::new(),
             };
 
-            let slice: &[u8] = &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES];
-            let prefix = slice.align_to::<u64>().0;
-            if !prefix.is_empty() {
-                return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            {
+                let slice: &[u8] = &storage.mapping.read().map_err(|_| Error::LockError)?[..HEADER_BYTES];
+                let prefix = slice.align_to::<u64>().0;
+                if !prefix.is_empty() {
+                    return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+                }
             }
-            let (header, _) = storage.parts_mut();
-            if header.clean == 0 {
-                return Err(Error::DirtyTrieState.into());
+            {
+                let mut view = storage.view_mut();
+                let header = view.header();
+                if *header.clean.get_mut() == 0 {
+                    return Err(Error::DirtyTrieState.into());
+                }
+
+                // Set our clean value to 0 and flush so we can detect if we aren't closed properly
+                *header.clean.get_mut() = 0;
             }
-
-            // Set our clean value to 0 and flush so we can detect if we aren't closed properly
-            header.clean = 0;
-
             storage
                 .mapping
-                .as_mut()
-                .unwrap_unchecked()
+                .read()
+                .map_err(|_| Error::LockError)?
                 .flush_range(0, HEADER_BYTES)?;
             Ok(storage)
         }
@@ -504,22 +669,24 @@ impl Storage {
     }
 
     unsafe fn restore_inner(storage: &mut Storage) -> Result<()> {
-        let slice: &[u8] = unsafe { &storage.mapping.as_ref().unwrap_unchecked()[..HEADER_BYTES] };
-        let prefix = unsafe { slice.align_to::<u64>().0 };
-        if !prefix.is_empty() {
-            return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+        {
+            let slice: &[u8] = &storage.mapping.read().map_err(|_| Error::LockError)?[..HEADER_BYTES];
+            let prefix = unsafe { slice.align_to::<u64>().0 };
+            if !prefix.is_empty() {
+                return Err(Error::InvalidAlignment(size_of::<u64>(), prefix.len()).into());
+            }
         }
-
         // Clean the header out, setting root to 1 if it's invalid and wiping the freelist.
-        let (header, words) = storage.parts_mut();
-        header.clean = 0;
-        if header.root == 0 || header.root as usize > words.len() {
-            header.root = 1;
+        let mut view = storage.view_mut();
+        let (header, words) = view.parts();
+        *header.clean.get_mut() = 0;
+        if *header.root.get_mut() == 0 || *header.root.get_mut() as usize > words.len() {
+            *header.root.get_mut() = 1;
         }
-        header.freelist.fill(u64::MAX);
+        header.freelist.iter_mut().for_each(|x| *x.get_mut() = u128::MAX);
 
         let mut validnodes = HashSet::new();
-        Self::scan_valid_nodes(header.root, words, &mut validnodes);
+        Self::scan_valid_nodes(*header.root.get_mut(), words, &mut validnodes);
 
         words[0] = u64::MAX;
         let mut count = 0;
@@ -536,8 +703,9 @@ impl Storage {
             if valid || count >= MAX_NODE_SIZE {
                 assert!(count <= MAX_NODE_SIZE);
                 if count >= MIN_NODE_SIZE {
-                    words[target as usize] = header.freelist[count - MIN_NODE_SIZE];
-                    header.freelist[count - MIN_NODE_SIZE] = target;
+                    let word = header.freelist[count - MIN_NODE_SIZE].get_mut();
+                    words[target as usize] = *word as u64;
+                    *word = Header::tag(target, 0);
                 }
 
                 count = 0;
@@ -566,7 +734,7 @@ impl Storage {
                 return Err(Error::MemMapTooSmall(HEADER_BYTES, mapping.len()).into());
             }
             let mut storage = Storage {
-                mapping: Some(mapping),
+                mapping: mapping.into(),
                 handle: Some(src),
                 //dirty_pages: HashSet::new(),
             };
@@ -574,7 +742,7 @@ impl Storage {
             Self::restore_inner(&mut storage)?;
             // Now that we've recovered the file, flush the whole thing, keeping clean at 0 since we haven't closed it
             // yet.
-            storage.mapping.as_mut().unwrap_unchecked().flush()?;
+            storage.mapping.write().unwrap().flush()?;
             Ok(storage)
         }
     }
@@ -603,103 +771,90 @@ impl Storage {
 
     #[cfg(miri)]
     pub fn resize(&mut self) -> Result<()> {
-        if let Some(mapref) = &mut self.mapping {
-            unsafe {
-                let mapping = std::mem::take(mapref);
-                let maplen = mapping.len();
-                let mapcap = mapping.capacity();
-                let mut aligned = Vec::<u64>::from_raw_parts(
-                    mapping.leak().as_mut_ptr() as *mut u64,
-                    maplen / size_of::<u64>(),
-                    mapcap / size_of::<u64>(),
-                );
-                aligned.resize(aligned.len() * 2, 0);
-                let alignlen = aligned.len();
-                let aligncap = aligned.capacity();
-                let mut replace = Vec::from_raw_parts(
-                    aligned.leak().as_mut_ptr() as *mut u8,
-                    alignlen * size_of::<u64>(),
-                    aligncap * size_of::<u64>(),
-                );
-                mem::swap(mapref, &mut replace);
+        let mapref = self.mapping.write().map_err(|_| Error::LockError)?;
+        unsafe {
+            let mapping = std::mem::replace(mapref, Vec::new());
+            let maplen = mapping.len();
+            let mapcap = mapping.capacity();
+            let mut aligned = Vec::<u64>::from_raw_parts(
+                mapping.leak().as_mut_ptr() as *mut u64,
+                maplen / size_of::<u64>(),
+                mapcap / size_of::<u64>(),
+            );
+            aligned.resize(aligned.len() * 2, 0);
+            let alignlen = aligned.len();
+            let aligncap = aligned.capacity();
+            let mut replace = Vec::from_raw_parts(
+                aligned.leak().as_mut_ptr() as *mut u8,
+                alignlen * size_of::<u64>(),
+                aligncap * size_of::<u64>(),
+            );
+            mem::swap(mapref, &mut replace);
 
-                self.init_section(maplen, self.mapping.as_ref().unwrap_unchecked().len())?;
-            }
+            Self::init_section(&mut mapref, maplen, self.mapping.as_ref().unwrap_unchecked().len())?;
         }
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[cfg(not(miri))]
-    pub fn resize(&mut self) -> Result<()> {
-        self.flush()?;
-        if let Some(handle) = self.handle.as_ref() {
-            let old = mem::take(&mut self.mapping);
-            if let Some(mut m) = old {
-                let old_size = m.len();
-                let new_size = old_size * 2;
-                // Attempt an in-place resize
-                unsafe {
-                    self.mapping = Some(if handle.set_len(new_size as u64).is_ok() {
-                        if m.remap(new_size, memmap2::RemapOptions::new().may_move(true)).is_err() {
-                            drop(m);
-                            MmapMut::map_mut(handle)?
-                        } else {
-                            m
-                        }
-                    } else {
-                        drop(m);
-                        handle.set_len(new_size as u64)?;
-                        MmapMut::map_mut(handle)?
-                    });
-
-                    self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
-                }
-                return Ok(());
+    pub fn resize(&self) -> Result<()> {
+        let handle = self.handle.as_ref().ok_or(Error::OutOfMemory(0))?;
+        let mut map = self.mapping.write().map_err(|_| Error::LockError)?;
+        map.flush()?;
+        let old_size = map.len();
+        let new_size = old_size * 2;
+        handle.set_len(new_size as u64)?; // growing a mapped file is fine on Linux
+        unsafe {
+            if map
+                .remap(new_size, memmap2::RemapOptions::new().may_move(true))
+                .is_err()
+            {
+                *map = MmapMut::map_mut(handle)?; // old mapping still alive here; dropped by the assignment
             }
         }
-
-        Err(Error::OutOfMemory(0).into())
+        let new_size = map.len();
+        Self::init_section(&mut map, old_size, new_size)
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[cfg(not(miri))]
-    pub fn resize(&mut self) -> Result<()> {
-        self.flush()?;
-        if let Some(handle) = self.handle.as_ref() {
-            let old = mem::take(&mut self.mapping);
-            if let Some(m) = old {
-                let old_size = m.len();
-                let new_size = old_size * 2;
-                drop(m);
-                handle.set_len(new_size as u64)?;
+    //#[cfg(not(miri))]
+    pub fn resize(&self) -> Result<()> {
+        let handle = self.handle.as_ref().ok_or(Error::OutOfMemory(0))?;
+        let mut map = self.mapping.write().unwrap();
+        map.flush()?;
+        let old_size = map.len();
+        let new_size = old_size * 2;
 
-                unsafe {
-                    self.mapping = Some(MmapMut::map_mut(handle)?);
-                    self.init_section(old_size, self.mapping.as_ref().unwrap_unchecked().len())?;
-                }
-                return Ok(());
-            }
-        }
+        // On windows, MmapMut turns a length 0 map into an empty handle, so we can use it as a placeholder.
+        drop(mem::replace(&mut *map, unsafe {
+            memmap2::MmapOptions::new().len(0).map_mut(handle)?
+        }));
 
-        Err(Error::OutOfMemory(0).into())
+        let result: std::prelude::v1::Result<(), std::io::Error> = handle.set_len(new_size as u64);
+        // Swap the new handle back in even if we failed to resize it so the placeholder doesn't leak (unless creating the handle fails)
+        *map = unsafe { MmapMut::map_mut(handle)? };
+        result?;
+        let new_size = map.len();
+        Self::init_section(&mut map, old_size, new_size)
     }
 
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
+        // If a poison error happens, the trie may be in an inconsistent state, but we still have to try flushing it to disk anyway
+        // so we can rescue any valid data and then reconstruct the trie.
         #[cfg(not(miri))]
-        if let Some(mapping) = self.mapping.as_mut() {
-            mapping.flush()?;
-        }
+        self.mapping
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()?;
         Ok(())
     }
 
-    pub fn flush_async(&mut self) -> Result<()> {
-        #[cfg(not(miri))]
-        if let Some(mapping) = self.mapping.as_mut() {
-            mapping.flush_async()?;
-        }
+    /*pub fn flush_async(&self) -> Result<()> {
+        // TODO: is this even possible or does this hold a RwLock over an await point?
+            self.mapping.read().unwrap_or_else(std::sync::PoisonError::into_inner).flush_async()?;
         Ok(())
-    }
+    }*/
 }
 
 #[derive(Debug)]
@@ -707,7 +862,7 @@ pub struct HashedArrayTrie<K>
 where
     K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
-    pub storage: Rc<RefCell<Storage>>,
+    pub storage: Arc<Storage>,
     offset: u64,
     owner: bool,
     phantomkey: PhantomData<K>,
@@ -717,18 +872,19 @@ impl<K> HashedArrayTrie<K>
 where
     K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
-    pub fn new(storage: &Rc<RefCell<Storage>>, root: u64) -> HashedArrayTrie<K> {
+    pub fn new(storage: &Arc<Storage>, root: u64) -> HashedArrayTrie<K> {
         {
-            let mut store = storage.borrow_mut();
-            let (header, words) = store.parts_mut();
+            let store = storage.view();
+            let (header, words) = store.parts();
             assert_eq!(
-                root, header.root,
+                root,
+                header.root.load(Ordering::Relaxed),
                 "new() opens the header's root; use duplicate() for other handles"
             );
-            Self::add_ref(root as usize, words);
+            add_ref(root as usize, words);
         }
         HashedArrayTrie {
-            storage: Rc::clone(storage),
+            storage: storage.clone(),
             offset: root,
             owner: true,
             phantomkey: PhantomData,
@@ -737,126 +893,82 @@ where
 
     // Doesn't increment children refcounts, only valid when the prior node will be immediately deleted, hence being a "move"
     #[inline]
-    fn move_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
-        // TODO: this uses memmove but these should never overlap so a copy is slightly faster but it might not matter for
-        // small sizes
-        words.copy_within(from..=(from + count), to as usize);
+    fn move_node(from: usize, to: usize, count: usize, words: &[AtomicU64]) {
+        // Can't use copy_within because this must be done atomically.
+        for i in 0..=count {
+            words[to + i].store(words[from + i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 
     // Does a proper clone of a node, incrementing child refcounts if it isn't a leaf.
     #[inline]
-    fn clone_node(from: usize, to: u64, count: usize, words: &mut [u64]) {
+    fn clone_node(from: usize, to: usize, count: usize, words: &[AtomicU64]) {
         Self::move_node(from, to, count, words);
-        let f = Flags::from_ref_mut(&mut words[to as usize]);
-        f.set_refcount(1);
-        f.set_parity();
+        let leaf = {
+            let mut f = FlagView::new(words, to);
+            f.flags().set_refcount(1);
+            f.flags().set_parity();
+            f.flags().leaf()
+        };
 
         // If this isn't a leaf node, fixes the children's refcounts
-        if !Flags::from_ref_mut(&mut words[to as usize]).leaf() {
-            for i in (1 + to as usize)..=(count + to as usize) {
-                Self::add_ref(words[i] as usize, words);
+        if !leaf {
+            for i in (1 + to)..=(count + to) {
+                add_ref(words[i].load(Ordering::Relaxed) as usize, words);
             }
         }
     }
 
     #[inline]
-    fn add_ref(node: usize, words: &mut [u64]) {
-        let flags = Flags::from_ref_mut(&mut words[node]);
-        flags.set_refcount(flags.refcount() + 1);
-        flags.set_parity();
-    }
+    fn append(offset: usize, words: &[AtomicU64], index: u8, value: u64, count: usize) {
+        let mut f = Flags::load(words, offset);
+        let indice = f.offset(index);
+        f.append(index);
+        f.set_parity();
 
-    #[inline]
-    fn append(offset: usize, words: &mut [u64], index: u8, value: u64, count: usize) {
-        words[offset] |= 0b1 << index;
-        words[offset + count + 1] = value;
-
-        let node = Flags::from_ref_mut(&mut words[offset]);
-        node.set_parity();
-        let indice = node.offset(index);
-
-        // Do up to N swaps (going backwards) to get the value in the right cell
         for i in (indice..count).rev() {
-            words.swap(offset + i + 1, offset + i + 2);
+            // No need for any special handling here because we only call this on nodes that aren't shared with any other thread.
+            words[offset + 2 + i].store(words[offset + 1 + i].load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        words[offset + 1 + indice].store(value, Ordering::Relaxed);
+        // Only store the new value into the parent *after* we've finished setting up the child
+        words[offset].store(f.into(), Ordering::Relaxed);
     }
 
     #[inline]
-    fn remove(offset: usize, words: &mut [u64], index: u8, count: usize) -> u64 {
-        let indice = Flags::from_ref_mut(&mut words[offset]).offset(index);
-        words[offset] &= !(0b1 << index);
-        Flags::from_ref_mut(&mut words[offset]).set_parity();
+    fn remove(offset: usize, words: &[AtomicU64], index: u8, count: usize) -> u64 {
+        let mut f = Flags::load(words, offset);
+        let indice = f.offset(index);
+        f.set_mask(f.mask() & !(0b1 << index));
+        f.set_parity();
 
-        // Do up to N swaps (going forwards) to get the value we removed to the end
-        for i in indice..(count - 1) {
-            words.swap(offset + i + 1, offset + i + 2);
+        let value = words[offset + 1 + indice].load(Ordering::Relaxed);
+        for i in indice..count - 1 {
+            // No need for any special handling here because we only call this on nodes that aren't shared with any other thread.
+            words[offset + 1 + i].store(words[offset + 2 + i].load(Ordering::Relaxed), Ordering::Relaxed);
         }
 
-        let value = words[offset + count];
-        words[offset + count] = 0;
+        words[offset + count].store(0, Ordering::Relaxed);
+        words[offset].store(f.into(), Ordering::Relaxed);
 
         value
     }
 
-    pub fn verify_trie(root: u64, bits: usize, words: &[u64]) {
+    pub fn verify_trie(root: u64, bits: usize, words: &[AtomicU64]) {
         assert_ne!(root, 0);
         assert_ne!(root, u64::MAX);
-        assert_ne!(words[root as usize], 0);
-        assert_ne!(words[root as usize], u64::MAX);
-        let flags = Flags::from_ref(&words[root as usize]);
+        let flags = Flags::load(words, root as usize);
         if bits > 5 {
             let count = flags.count();
             for i in 1..=count {
-                Self::verify_trie(words[root as usize + i], bits - 5, words);
+                Self::verify_trie(words[root as usize + i].load(Ordering::Relaxed), bits - 5, words);
             }
         }
-    }
-
-    // Drops
-    fn release(offset: usize, header: &mut Header, words: &mut [u64]) -> Result<(), Error> {
-        assert_ne!(words[offset], 0);
-        assert_ne!(words[offset], u64::MAX);
-        // This performs a copy to avoid borrow problems
-        let node = *Flags::from_ref(&words[offset]);
-        if node.refcount() > 1 {
-            let f = Flags::from_ref_mut(&mut words[offset]);
-            f.set_refcount(f.refcount() - 1);
-            f.set_parity();
-            Ok(())
-        } else {
-            for i in 1..=node.count() {
-                if !node.leaf() {
-                    Self::release(words[offset + i] as usize, header, words)?;
-                }
-            }
-            Self::free_block(offset, header, words)
-        }
-    }
-
-    fn free_block(offset: usize, header: &mut Header, words: &mut [u64]) -> Result<(), Error> {
-        let mut count = Flags::from_ref(&words[offset]).count();
-        words[offset + 1..offset + 1 + count].fill(0);
-
-        // After setting the known cells to zero, walk forward to see if there were any orphaned cells
-        while offset + 1 + count < words.len() && words[offset + 1 + count] == 0 {
-            count += 1;
-        }
-
-        // This should never happen unless something is corrupted
-        assert_ne!(count, 0);
-        if count == 0 {
-            return Err(Error::DirtyTrieState.into());
-        }
-
-        // Add it to the appropriate freelist (0th index has 1 node, so  we use count - 1)
-        words[offset] = header.freelist[count - 1];
-        header.freelist[count - 1] = offset as u64;
-        Ok(())
     }
 
     fn insert_entry(
         offset: usize,
-        store: &mut RefMut<'_, Storage>,
+        store: &StorageView<'_>,
         count: usize,
         index: u8,
         value: u64,
@@ -864,11 +976,16 @@ where
     ) -> NodeResult {
         if count == MAX_CHILDREN {
             // This can only happen if the key already exists and somehow a previous check failed
-            return NodeResult::Err(Error::AlreadyExists(store.words()[offset + index as usize + 1]).into());
+            return NodeResult::Err(
+                Error::AlreadyExists(store.words()[offset + index as usize + 1].load(Ordering::Relaxed)).into(),
+            );
         }
         // If we are mutable and we have space, we just append the child and return nothing
-        if mutable && offset + count + 1 < store.words().len() && store.words()[offset + count + 1] == 0 {
-            Self::append(offset, store.words_mut(), index, value, count);
+        if mutable
+            && offset + count + 1 < store.words().len()
+            && store.words()[offset + count + 1].load(Ordering::Relaxed) == 0
+        {
+            Self::append(offset, store.words(), index, value, count);
             NodeResult::InPlace
         } else {
             // Otherwise, we must clone ourselves
@@ -876,20 +993,21 @@ where
                 Ok(x) => x,
                 Err(e) => return NodeResult::Err(e),
             };
-            let (header, words) = store.parts_mut();
 
             // If we have mutable access, just move
             if mutable {
-                Self::move_node(offset, n, count, words);
+                let words = store.words();
+                Self::move_node(offset, n as usize, count, words);
                 Self::append(n as usize, words, index, value, count);
-                if let Err(e) = Self::free_block(offset, header, words) {
+                if let Err(e) = store.free_block(offset) {
                     NodeResult::Err(e)
                 } else {
                     NodeResult::Moved(n)
                 }
             } else {
                 // Otherwise, we have to copy
-                Self::clone_node(offset, n, count, words);
+                let words = store.words();
+                Self::clone_node(offset, n as usize, count, words);
                 Self::append(n as usize, words, index, value, count);
                 NodeResult::Copied(n)
             }
@@ -898,13 +1016,13 @@ where
 
     fn insert_node(
         offset: usize,
-        store: &mut RefMut<'_, Storage>,
+        store: &StorageView<'_>,
         bits: usize,
         key: K,
         value: u64,
         mutable: bool,
     ) -> NodeResult {
-        let node = *Flags::from_ref(&store.words()[offset]);
+        let node = Flags::load(store.words(), offset);
         let count = node.count();
 
         //let mutable = mutable && node.refcount() == 1;
@@ -912,7 +1030,9 @@ where
             let index: u8 = key.as_() & (0b11111 >> (5 - bits));
             // Check if the child exists already
             return if node.exists(index) {
-                NodeResult::Err(Error::AlreadyExists(store.words()[offset + node.offset(index) + 1]).into())
+                NodeResult::Err(
+                    Error::AlreadyExists(store.words()[offset + node.offset(index) + 1].load(Ordering::Relaxed)).into(),
+                )
             } else {
                 Self::insert_entry(offset, store, count, index, value, mutable)
             };
@@ -933,7 +1053,7 @@ where
             // Setup new empty node
             let mut fnew = Flags::new().with_refcount(1).with_leaf(bits <= 10);
             fnew.set_parity();
-            store.words_mut()[child as usize] = fnew.into();
+            store.words()[child as usize].store(fnew.into(), Ordering::Release);
 
             let n = match Self::insert_node(child as usize, store, bits - 5, key, value, true) {
                 NodeResult::InPlace => child,
@@ -956,21 +1076,21 @@ where
 
         // If it does exist, just recurse into it
         let child_offset = offset + node.offset(index) + 1;
-        let child = store.words()[child_offset];
-        let child_mutable = mutable && Flags::from_ref(&store.words()[child as usize]).refcount() == 1;
+        let child = store.words()[child_offset].load(Ordering::Acquire);
+        let child_mutable = mutable && Flags::load(store.words(), child as usize).refcount() == 1;
 
         match Self::insert_node(child as usize, store, sbits, key, value, child_mutable) {
             NodeResult::InPlace => NodeResult::InPlace,
             NodeResult::Moved(n) => {
                 // Should have only happened if we are mutable
                 debug_assert!(mutable);
-                store.words_mut()[child_offset] = n;
+                store.words()[child_offset].store(n, Ordering::Relaxed);
                 NodeResult::InPlace
             }
             NodeResult::Copied(n) if mutable => {
-                let (header, words) = store.parts_mut();
-                words[child_offset] = n;
-                if let Err(e) = Self::release(child as usize, header, words) {
+                let words = store.words();
+                words[child_offset].store(n, Ordering::Relaxed);
+                if let Err(e) = store.release(child as usize) {
                     NodeResult::Err(e)
                 } else {
                     NodeResult::InPlace
@@ -986,10 +1106,10 @@ where
                     }
                 };
 
-                let (header, words) = store.parts_mut();
-                Self::clone_node(offset, clone, count, words);
-                words[clone as usize + (child_offset - offset)] = n;
-                if let Err(e) = Self::release(child as usize, header, words) {
+                let words = store.words();
+                Self::clone_node(offset, clone as usize, count, words);
+                words[clone as usize + (child_offset - offset)].store(n, Ordering::Release);
+                if let Err(e) = store.release(child as usize) {
                     NodeResult::Err(e)
                 } else {
                     NodeResult::Copied(clone)
@@ -1008,29 +1128,29 @@ where
     // Inserts a new key and value on an exclusive reference to a particular root - call duplicate() to clone
     // a root.
     pub fn insert(&mut self, key: K, value: u64) -> Result<(), Error> {
-        let mut store = self.storage.borrow_mut();
+        let store = self.storage.view();
         let offset: usize = self.offset as usize;
         let bits = size_of::<K>() * 8;
-        let mutable = Flags::from_ref(&store.words()[offset]).refcount() == self.active_refs();
+        let mutable = Flags::load(store.words(), offset).refcount() == self.active_refs();
 
-        match Self::insert_node(offset, &mut store, bits, key, value, mutable) {
+        match Self::insert_node(offset, &store, bits, key, value, mutable) {
             NodeResult::InPlace => Ok(()),
             NodeResult::Moved(n) => {
                 if self.owner {
-                    store.parts_mut().0.root = n;
+                    store.header().root.store(n, Ordering::Release);
                 }
                 self.offset = n;
                 Ok(())
             }
             NodeResult::Copied(n) => {
-                let (header, words) = store.parts_mut();
+                let (header, words) = store.parts();
                 if self.owner {
                     // Increment new reference before releasing the old one
-                    Self::add_ref(n as usize, words);
-                    header.root = n;
-                    Self::release(offset, header, words)?;
+                    add_ref(n as usize, words);
+                    header.root.store(n, Ordering::Release);
+                    store.release(offset)?;
                 }
-                Self::release(offset, header, words)?;
+                store.release(offset)?;
                 self.offset = n;
                 Ok(())
             }
@@ -1038,26 +1158,33 @@ where
         }
     }
 
-    // In the future, this will be a fallible clone
-    pub fn duplicate(&self) -> HashedArrayTrie<K> {
-        let mut store = self.storage.borrow_mut();
-        Self::add_ref(self.offset as usize, store.words_mut());
-        HashedArrayTrie {
-            storage: Rc::clone(&self.storage),
-            offset: self.offset,
+    pub fn duplicate(&self) -> Result<Self, Error> {
+        const MAX_ROOT_REFS: u64 = 127;
+        let offset = self.offset;
+
+        let view = self.storage.view();
+        let prev = Flags::from(add_ref(offset as usize, view.words())).refcount() as u64;
+        if prev >= MAX_ROOT_REFS {
+            view.words()[offset as usize].fetch_sub(REFCOUNT_ONE, Ordering::Relaxed);
+            return Err(Error::TooManyRefs(prev));
+        }
+
+        Ok(Self {
+            storage: self.storage.clone(),
+            offset,
             owner: false,
             phantomkey: PhantomData,
-        }
+        })
     }
 
     pub fn get(&self, key: K) -> Result<u64, Error> {
-        let store = self.storage.borrow();
+        let store = self.storage.view();
         let mut offset: usize = self.offset as usize;
         let mut bits = size_of::<K>() * 8;
         let words = store.words();
 
         while bits > 5 {
-            let node = Flags::from_ref(&words[offset]);
+            let node = Flags::load(words, offset);
             let index: u8 = key.shr(bits - 5).as_() & 0b11111;
 
             // Check if the node is set
@@ -1070,11 +1197,11 @@ where
                 .into());
             }
 
-            offset = words[offset + node.offset(index) + 1] as usize;
+            offset = words[offset + node.offset(index) + 1].load(Ordering::Relaxed) as usize;
             bits -= 5;
         }
 
-        let node = Flags::from_ref(&words[offset]);
+        let node = Flags::load(words, offset);
         let index: u8 = key.as_() & (0b11111 >> (5 - bits));
 
         // Check if the node is set
@@ -1087,17 +1214,11 @@ where
             .into());
         }
 
-        Ok(words[offset + node.offset(index) + 1])
+        Ok(words[offset + node.offset(index) + 1].load(Ordering::Relaxed))
     }
 
-    fn delete_node(
-        offset: usize,
-        store: &mut RefMut<'_, Storage>,
-        bits: usize,
-        key: K,
-        held: u8,
-    ) -> Result<u64, Error> {
-        let node = Flags::from_ref_mut(&mut store.words_mut()[offset]);
+    fn delete_node(offset: usize, store: &StorageView<'_>, bits: usize, key: K, held: u8) -> Result<u64, Error> {
+        let node = Flags::load(store.words(), offset);
         if node.refcount() > held {
             return Err(Error::Shared(offset as u64));
         }
@@ -1117,14 +1238,13 @@ where
 
             let child_offset = offset + node.offset(index) + 1;
             let count = node.count();
-            let child = store.words()[child_offset] as usize;
+            let child = store.words()[child_offset].load(Ordering::Relaxed) as usize;
             let value = Self::delete_node(child, store, bits - 5, key, 1)?;
 
-            if Flags::from_ref(&store.words()[child]).count() == 0 {
-                let (header, words) = store.parts_mut();
-                let check = Self::remove(offset, words, index, count);
+            if Flags::load(store.words(), child).count() == 0 {
+                let check = Self::remove(offset, store.words(), index, count);
                 assert_eq!(check, child as u64);
-                Self::release(child, header, words)?;
+                store.release(child)?;
             }
 
             Ok(value)
@@ -1142,24 +1262,23 @@ where
             }
 
             let count = node.count();
-            let (_, words) = store.parts_mut();
+            let words = store.words();
             let value = Self::remove(offset, words, index, count);
             Ok(value)
         }
     }
 
     pub fn delete(&mut self, key: K) -> Result<u64, Error> {
-        let mut store = self.storage.borrow_mut();
+        let store = self.storage.view();
 
         let offset: usize = self.offset as usize;
         let bits = size_of::<K>() * 8;
-        Self::delete_node(offset, &mut store, bits, key, self.active_refs())
+        Self::delete_node(offset, &store, bits, key, self.active_refs())
     }
 
     #[inline]
-    fn cleanup(node: u64, store: &mut RefMut<'_, Storage>) {
-        let (header, words) = store.parts_mut();
-        let result = Self::release(node as usize, header, words);
+    fn cleanup(node: u64, store: &StorageView<'_>) {
+        let result = store.release(node as usize);
         debug_assert!(result.is_ok(), "cleanup failed for {node}");
     }
 }
@@ -1169,19 +1288,18 @@ where
     K: num::PrimInt + num::cast::AsPrimitive<u8>,
 {
     fn drop(&mut self) {
-        let mut store = self.storage.borrow_mut();
-        let (header, words) = store.parts_mut();
-        let released = Self::release(self.offset as usize, header, words);
-        debug_assert!(released.is_ok(), "failed to release root {}", self.offset);
+        let v = self.storage.view();
+        let offset = self.offset as usize;
+        let released = v.release(offset);
+        debug_assert!(released.is_ok(), "failed to release root {offset}");
     }
 }
 
-#[cfg(not(miri))]
+//#[cfg(not(miri))]
 impl Drop for Storage {
     fn drop(&mut self) {
         // Set our clean close bit to 1 and flush.
-        let (header, _) = self.parts_mut();
-        header.clean = 1;
+        self.view_mut().header().clean.store(1, Ordering::Release);
         // We have to ignore any errors here because we're already in the process of closing everything.
         let _ = self.flush();
     }
@@ -1291,6 +1409,9 @@ fn test_parity() {
     assert!(a.check_parity());
 
     a.set_refcount(1);
+    assert_eq!(a.calc_parity(), 0, "refcount is excluded from parity");
+    a.set_refcount(0);
+    a.set_mask(1);
     assert_ne!(a.0, 0);
     assert!(!a.get_parity());
     assert_eq!(a.calc_parity(), 1);
@@ -1354,29 +1475,32 @@ fn test_out_of_storage() -> Result<()> {
     #[cfg(not(miri))]
     let fileref = tempfile()?;
     #[cfg(not(miri))]
-    let mut store = Storage::new_ref(&fileref, 32)?;
+    let store = Storage::new_ref(&fileref, 32)?;
     #[cfg(miri)]
-    let mut store = Storage::new(Path::new(""), 32)?;
+    let store = Storage::new(Path::new(""), 32)?;
 
-    store.allocate(1)?;
-    let e = store.allocate(32).expect_err("Should have run out of memory?!");
-    assert_eq!(e, Error::OutOfMemory(576));
+    store.view().allocate(1)?;
+    let e = store.view().allocate(32).expect_err("Should have run out of memory?!");
+    assert_eq!(e, Error::OutOfMemory(832)); // header grew by 32 * 8 bytes (128-bit tagged pointers)
     Ok(())
 }
 
 #[test]
 fn test_storage_allocate() -> Result<()> {
     #[cfg(not(miri))]
-    let mut store = Storage::new_file(tempfile()?, 32)?;
+    let store = Storage::new_file(tempfile()?, 32)?;
     #[cfg(miri)]
-    let mut store = Storage::new(Path::new(""), 32)?;
+    let store = Storage::new(Path::new(""), 32)?;
 
     for i in 1..=32 {
-        while let Err(e) = store.allocate(i) {
-            match e {
-                Error::OutOfMemory(_) => store.resize(),
-                err => Err(err.into()),
-            }?;
+        loop {
+            // Don't hold view() past this statement or it deadlocks
+            let result = store.view().allocate(i);
+            match result {
+                Ok(_) => break,
+                Err(Error::OutOfMemory(_)) => store.resize(),
+                Err(err) => Err(err.into()),
+            }?
         }
     }
     Ok(())
@@ -1388,19 +1512,22 @@ fn test_storage_load() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let mut store = Storage::new_ref(&fileref, 64)?;
-        store.allocate(1)?;
-        store.allocate(1)?;
+        let store = Storage::new_ref(&fileref, 64)?;
+        store.view().allocate(1)?;
+        store.view().allocate(1)?;
     }
 
     {
-        let mut store = Storage::load_file(fileref)?;
+        let store = Storage::load_file(fileref)?;
         for i in 1..=32 {
-            while let Err(e) = store.allocate(i) {
-                match e {
-                    Error::OutOfMemory(_) => store.resize(),
-                    err => Err(err.into()),
-                }?;
+            loop {
+                // Don't hold view() past this statement or it deadlocks
+                let result = store.view().allocate(i);
+                match result {
+                    Ok(_) => break,
+                    Err(Error::OutOfMemory(_)) => store.resize(),
+                    Err(err) => Err(err.into()),
+                }?
             }
         }
     }
@@ -1411,9 +1538,9 @@ fn test_storage_load() -> Result<()> {
 #[test]
 fn test_empty() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 32)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 32)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 32)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 32)?);
 
     // We will eventually put a 128-bit FullLogID struct in here
     let _: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
@@ -1423,9 +1550,9 @@ fn test_empty() -> Result<()> {
 #[test]
 fn test_deep_near_miss() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1024)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1024)?);
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1438,9 +1565,9 @@ fn test_deep_near_miss() -> Result<()> {
 #[test]
 fn test_duplicate() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1024)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1024)?);
 
     let mut trie: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1454,9 +1581,9 @@ fn test_duplicate() -> Result<()> {
 #[test]
 fn test_delete() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1024)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1024)?);
 
     let mut trie: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1477,9 +1604,9 @@ fn test_delete() -> Result<()> {
 #[test]
 fn test_near_miss() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1024)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1024)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1024)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1024)?);
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     trie.insert(1, 1)?;
@@ -1492,9 +1619,9 @@ fn test_near_miss() -> Result<()> {
 #[test]
 fn test_fill_leaf() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 13)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 13)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 13)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1 << 13)?);
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
     for i in 0..32 {
@@ -1510,15 +1637,15 @@ fn test_fill_leaf() -> Result<()> {
 #[test]
 fn test_fill_node() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 13)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 13)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 13)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1 << 13)?);
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
     for i in 0..32 {
         trie.insert(i << 6, i as u64 + 10000)?;
-        HashedArrayTrie::<u128>::verify_trie(1, 128, trie.storage.as_ref().borrow().words());
+        HashedArrayTrie::<u128>::verify_trie(1, 128, trie.storage.view().words());
     }
 
     for i in 0..32 {
@@ -1532,9 +1659,9 @@ fn test_fill_node() -> Result<()> {
 #[test]
 fn test_fill_trie() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 1 << 22)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 22)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 1 << 16)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 1 << 16)?);
 
     #[cfg(not(miri))]
     const MAX_COUNT: u16 = u16::MAX;
@@ -1604,9 +1731,9 @@ fn test_fill_trie() -> Result<()> {
 #[test]
 fn test_fill_random() -> Result<()> {
     #[cfg(not(miri))]
-    let storage = Rc::new(RefCell::new(Storage::new_file(tempfile()?, 32)?));
+    let storage = Arc::new(Storage::new_file(tempfile()?, 32)?);
     #[cfg(miri)]
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), 32)?));
+    let storage = Arc::new(Storage::new(Path::new(""), 32)?);
 
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
@@ -1624,13 +1751,13 @@ fn test_fill_random() -> Result<()> {
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
             match e {
-                Error::OutOfMemory(_) => storage.borrow_mut().resize(),
+                Error::OutOfMemory(_) => storage.resize(),
                 err => Err(err.into()),
             }?;
         }
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     // Remove and re-insert every key
     for i in &track {
@@ -1638,34 +1765,34 @@ fn test_fill_random() -> Result<()> {
         trie.insert(*i, *i as u64)?;
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     // Remove everything first, then re-insert every key, ensuring no additional space is used
     for i in &track {
         assert_eq!(trie.delete(*i)?, *i as u64);
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     for i in &track {
         trie.insert(*i, *i as u64)?;
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     // Verify all values are correct
     for i in &track {
         assert_eq!(trie.get(*i).expect("Failed to get key"), *i as u64);
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     //delete everything one more time
     for i in track {
         assert_eq!(trie.delete(i)?, i as u64);
     }
 
-    storage.borrow_mut().flush()?;
+    storage.flush()?;
 
     Ok(())
 }
@@ -1676,19 +1803,16 @@ fn test_fill_random() -> Result<()> {
 fn test_allocations() -> Result<()> {
     for sz in 1..=512 {
         #[cfg(not(miri))]
-        let storage = Rc::new(RefCell::new(Storage::new_file(
-            tempfile()?,
-            sz * size_of::<u64>() as u64,
-        )?));
+        let storage = Arc::new(Storage::new_file(tempfile()?, sz * size_of::<u64>() as u64)?);
         #[cfg(miri)]
-        let storage = Rc::new(RefCell::new(Storage::new(Path::new(""), sz * size_of::<u64>() as u64)?));
+        let storage = Arc::new(Storage::new(Path::new(""), sz * size_of::<u64>() as u64)?);
 
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         for i in 0..=255 {
             while let Err(e) = trie.insert(i, i as u64) {
                 match e {
-                    Error::OutOfMemory(_) => storage.borrow_mut().resize(),
+                    Error::OutOfMemory(_) => storage.resize(),
                     err => Err(err.into()),
                 }?;
             }
@@ -1706,7 +1830,7 @@ fn test_storage_restore_simple() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let storage = Rc::new(RefCell::new(Storage::new_ref(&fileref, 296)?));
+        let storage = Arc::new(Storage::new_ref(&fileref, 296)?);
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         trie.insert(1, 1).expect("Insertion failure!");
@@ -1714,7 +1838,7 @@ fn test_storage_restore_simple() -> Result<()> {
     }
 
     {
-        let storage = Rc::new(RefCell::new(Storage::restore_file(fileref)?));
+        let storage = Arc::new(Storage::restore_file(fileref)?);
         let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
         assert_eq!(trie.get(1).expect("Failed to get key"), 1);
     }
@@ -1728,7 +1852,7 @@ fn test_storage_restore() -> Result<()> {
     let fileref = tempfile()?;
 
     {
-        let storage = Rc::new(RefCell::new(Storage::new_ref(&fileref, 1 << 16)?));
+        let storage = Arc::new(Storage::new_ref(&fileref, 1 << 16)?);
         let mut trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
         // Fill an 8-bit trie with with every single possible key
         let mut v: Vec<u8> = (0..=u8::MAX).collect();
@@ -1746,7 +1870,7 @@ fn test_storage_restore() -> Result<()> {
     }
 
     {
-        let storage = Rc::new(RefCell::new(Storage::restore_file(fileref)?));
+        let storage = Arc::new(Storage::restore_file(fileref)?);
         let trie: HashedArrayTrie<u8> = HashedArrayTrie::new(&storage, 1);
 
         for i in 0..=u8::MAX {
@@ -1754,5 +1878,262 @@ fn test_storage_restore() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// TODO: replace AI generated tests
+
+#[cfg(test)]
+fn expected_refcounts(roots: &[u64], words: &[AtomicU64]) -> std::collections::HashMap<u64, u32> {
+    let mut expected = std::collections::HashMap::new();
+    let mut stack = Vec::new();
+    let visit = |node: u64, expected: &mut std::collections::HashMap<u64, u32>, stack: &mut Vec<u64>| {
+        let e = expected.entry(node).or_insert(0);
+        if *e == 0 {
+            stack.push(node);
+        }
+        *e += 1;
+    };
+    for &r in roots {
+        visit(r, &mut expected, &mut stack);
+    }
+    while let Some(n) = stack.pop() {
+        let f = Flags::load(words, n as usize);
+        if !f.leaf() {
+            for i in 1..=f.count() {
+                visit(words[n as usize + i].load(Ordering::Relaxed), &mut expected, &mut stack);
+            }
+        }
+    }
+    expected
+}
+
+#[cfg(test)]
+fn verify_refcounts(roots: &[u64], words: &[AtomicU64]) {
+    for (node, want) in expected_refcounts(roots, words) {
+        let f = Flags::load(words, node as usize);
+        assert!(f.check_parity(), "bad parity on node {node}");
+        assert_eq!(f.refcount() as u32, want, "refcount mismatch on node {node}");
+    }
+}
+
+/// Every word must be the canary, part of a reachable node, part of a free block, or zeroed slack.
+/// Anything else is a leaked node.
+#[cfg(test)]
+fn find_leaks(roots: &[u64], storage: &Storage) -> Vec<usize> {
+    let view = storage.view();
+    let (header, words) = view.parts();
+    let mut owned = vec![false; words.len()];
+    owned[0] = true;
+    for (i, head) in header.freelist.iter().enumerate() {
+        let mut b = head.load(Ordering::Relaxed) as u64;
+        while b != u64::MAX {
+            owned[b as usize..(b as usize + i + 2).min(words.len())].fill(true);
+            b = words[b as usize].load(Ordering::Relaxed);
+        }
+    }
+    for &node in expected_refcounts(roots, words).keys() {
+        let count = Flags::load(words, node as usize).count();
+        owned[node as usize..=node as usize + count].fill(true);
+    }
+    (1..words.len())
+        .filter(|&w| !owned[w] && words[w].load(Ordering::Relaxed) != 0)
+        .collect()
+}
+
+/// Checks refcounts and leaks for the header's root plus the roots of the live handles passed in.
+/// With no handles, this is exactly the shutdown invariant: counts match what is reachable from the header.
+#[cfg(test)]
+fn check(handles: &[u64], storage: &Arc<Storage>) {
+    let roots = {
+        let s = storage.view();
+        let mut roots = vec![s.header().root.load(Ordering::Relaxed)];
+        roots.extend_from_slice(handles);
+        verify_refcounts(&roots, s.words());
+        roots
+    };
+    assert_eq!(find_leaks(&roots, storage), Vec::<usize>::new(), "leaked words");
+}
+
+#[cfg(test)]
+use rand::RngExt;
+
+#[cfg(not(miri))]
+#[test]
+fn test_fork_isolation() -> Result<()> {
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 20)?);
+    check(&[], &storage); // fresh file: the header's root has refcount 1
+
+    let mut a: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
+    for k in 0..512u16 {
+        a.insert(k * 37, k as u64)?;
+    }
+    assert_eq!(
+        a.offset, 1,
+        "the owner writes in place while nobody else holds its root"
+    );
+    let mut b = a.duplicate()?;
+    check(&[a.offset, b.offset], &storage);
+
+    // Deletes are refused on shared paths, and the refusal changes nothing.
+    let e = a.delete(0).expect_err("root is shared right after a fork");
+    assert!(matches!(e, Error::Shared { .. }));
+    assert_eq!(b.get(0)?, 0);
+
+    // Interleave writes on both versions. Each write copies only the path it touches.
+    for k in 0..512u16 {
+        b.insert(k * 37 + 1, 1)?;
+        a.insert(k * 37 + 2, 2)?;
+        if k % 64 == 0 {
+            check(&[a.offset, b.offset], &storage);
+        }
+    }
+    check(&[a.offset, b.offset], &storage);
+    assert_eq!(
+        storage.view().header().root.load(Ordering::Relaxed),
+        a.offset,
+        "the owner publishes its root; the fork doesn't"
+    );
+    for k in 0..512u16 {
+        assert_eq!(a.get(k * 37)?, k as u64);
+        assert_eq!(b.get(k * 37)?, k as u64);
+        assert!(
+            a.get(k * 37 + 1).is_err() && b.get(k * 37 + 2).is_err(),
+            "write leaked across versions"
+        );
+    }
+
+    drop(b);
+    check(&[a.offset], &storage);
+    // Unshared again, so deletes work.
+    assert_eq!(a.delete(0)?, 0);
+    drop(a);
+    // Shutdown invariant: only the header holds a reference, and everything it reaches is intact.
+    check(&[], &storage);
+    let root = storage.view().header().root.load(Ordering::Relaxed);
+    let a: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, root);
+    assert_eq!(a.get(37)?, 1);
+    assert!(a.get(0).is_err());
+    Ok(())
+}
+
+#[cfg(not(miri))]
+#[test]
+fn test_fork_random_u128() -> Result<()> {
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 12)?);
+    let mut rng = rand::rng();
+    // versions[0] starts as the header's owner; it may be dropped like any other handle.
+    let mut versions: Vec<(HashedArrayTrie<u128>, Vec<u128>)> = vec![(HashedArrayTrie::new(&storage, 1), vec![])];
+    let roots = |v: &Vec<(HashedArrayTrie<u128>, Vec<u128>)>| v.iter().map(|x| x.0.offset).collect::<Vec<_>>();
+    for step in 0..4000 {
+        let i = rng.random_range(0..versions.len());
+        match rng.random_range(0..10) {
+            0 if versions.len() < 8 => {
+                let fork = (versions[i].0.duplicate()?, versions[i].1.clone());
+                versions.push(fork);
+            }
+            1 if versions.len() > 1 => {
+                versions.swap_remove(i); // Drop releases the handle's reference
+            }
+            _ => {
+                let key = get_next_u128(&mut rng);
+                loop {
+                    match versions[i].0.insert(key, key as u64) {
+                        Ok(()) => break,
+                        Err(e) => match e {
+                            Error::OutOfMemory(_) => {
+                                // ITEM 5: a failed insert must not leak or skew refcounts.
+                                check(&roots(&versions), &storage);
+                                storage.resize()?;
+                            }
+                            err => return Err(err.into()),
+                        },
+                    }
+                }
+                versions[i].1.push(key);
+            }
+        }
+        if step % 500 == 0 {
+            check(&roots(&versions), &storage);
+        }
+    }
+    for (t, keys) in &versions {
+        for k in keys {
+            assert_eq!(t.get(*k)?, *k as u64);
+        }
+    }
+    check(&roots(&versions), &storage);
+    drop(versions);
+    check(&[], &storage);
+    Ok(())
+}
+
+/// The owner's root moves (Rewrite::Moved) only after it has been copied out of the reserved area at offset 1.
+/// A move must keep BOTH references (header + handle) and repoint the header.
+#[cfg(not(miri))]
+#[test]
+fn test_owner_root_moves() -> Result<()> {
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 16)?);
+    let mut a: HashedArrayTrie<u16> = HashedArrayTrie::new(&storage, 1);
+    a.insert(0, 0)?;
+    let b = a.duplicate()?;
+    a.insert(1 << 11, 1)?; // shared root: copied into an ordinary block with no reserved slack
+    drop(b);
+    check(&[a.offset], &storage);
+
+    let mut moves = 0;
+    for top in 2..32u16 {
+        let before = a.offset;
+        a.insert(top << 11, top as u64)?; // new top-level index on an exclusively owned root
+        if a.offset != before {
+            moves += 1;
+        }
+        check(&[a.offset], &storage);
+        assert_eq!(
+            storage.view().header().root.load(Ordering::Relaxed),
+            a.offset,
+            "a move must repoint the header"
+        );
+    }
+    assert!(
+        moves > 0,
+        "expected the owner's root to outgrow its block at least once"
+    );
+    drop(a);
+    check(&[], &storage);
+    Ok(())
+}
+
+#[cfg(not(miri))]
+#[test]
+fn test_threads_duplicate_insert_drop() -> Result<()> {
+    let storage = Arc::new(Storage::new_file(tempfile()?, 1 << 24)?);
+    let mut owner: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
+    for k in 0..2000u128 {
+        owner.insert(k, k as u64)?;
+    }
+    for _round in 0..20 {
+        let handles: Vec<_> = (0..8).map(|_| owner.duplicate()).collect::<Result<_, _>>()?;
+        std::thread::scope(|s| {
+            for (t, mut h) in handles.into_iter().enumerate() {
+                s.spawn(move || {
+                    for k in 0..500u128 {
+                        let key = ((t as u128 + 1) << 64) | k;
+                        h.insert(key, k as u64).unwrap();
+                        assert_eq!(h.get(key).unwrap(), k as u64);
+                    }
+                    for k in 0..2000u128 {
+                        assert_eq!(h.get(k).unwrap(), k as u64); // shared, never-copied subtrees
+                    }
+                    // h dropped here, concurrently with the other threads' drops and inserts
+                });
+            }
+        });
+        check(&[owner.offset], &storage);
+        // owner keeps writing in place between rounds
+        owner.insert(1_000_000 + _round as u128, 7)?;
+    }
+    drop(owner);
+    check(&[], &storage);
     Ok(())
 }

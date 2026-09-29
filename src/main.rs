@@ -2,9 +2,7 @@ use caplog::MAX_BUFFER_SIZE;
 use caplog::hashed_array_trie::{self, HashedArrayTrie, Storage};
 use caplog::{CapLog, log_capnp::log_entry};
 use capnp::any_pointer;
-use std::cell::RefCell;
 use std::io::Write;
-use std::rc::Rc;
 use std::{path::Path, sync::Arc, time::SystemTime};
 
 #[allow(dead_code)]
@@ -89,7 +87,7 @@ fn raw_log_benchmark(start: SystemTime) -> eyre::Result<()> {
 fn raw_trie_benchmark(start: SystemTime) {
     const MAX_COUNT: u64 = 0xFFFFFF;
 
-    let storage = Rc::new(RefCell::new(Storage::new(Path::new("output.txt"), 32).unwrap()));
+    let storage = Arc::new(Storage::new(Path::new("output.txt"), 32).unwrap());
     let mut trie: HashedArrayTrie<u128> = HashedArrayTrie::new(&storage, 1);
 
     let mut rng = rand::rng();
@@ -101,7 +99,7 @@ fn raw_trie_benchmark(start: SystemTime) {
         track.push(key);
         while let Err(e) = trie.insert(key, key as u64) {
             match e {
-                hashed_array_trie::Error::OutOfMemory(_) => storage.borrow_mut().resize(),
+                hashed_array_trie::Error::OutOfMemory(_) => storage.resize(),
                 err => Err(err.into()),
             }
             .unwrap();
@@ -122,7 +120,7 @@ fn raw_trie_benchmark(start: SystemTime) {
         assert_eq!(trie.get(*i).expect("Failed to get key"), *i as u64);
     }
 
-    storage.borrow_mut().flush().unwrap();
+    storage.flush().unwrap();
 }
 
 fn main() {

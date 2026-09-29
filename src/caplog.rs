@@ -11,7 +11,6 @@ use capnp::traits::ImbueMut;
 use eyre::Result;
 use eyre::eyre;
 use std::alloc;
-use std::cell::RefCell;
 
 #[cfg(miri)]
 use crate::fakefile::FakeFile;
@@ -22,7 +21,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -392,7 +390,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
         max_open_files: usize,
         check_consistency: bool,
     ) -> Result<Self> {
-        let storage = Rc::new(RefCell::new(trie_storage));
+        let storage = Arc::new(trie_storage);
         let archive = FileManagement {
             prefix: data_prefix.to_path_buf(),
             max_open_files,
@@ -569,7 +567,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
                 return Err(e.into());
             }
 
-            self.trie.storage.borrow_mut().flush()?;
+            self.trie.storage.flush()?;
 
             Ok((flusher, state))
         } else {
@@ -607,7 +605,7 @@ impl<const BUFFER_SIZE: usize> CapLog<BUFFER_SIZE> {
     fn trie_insert(&mut self, id: u128, value: u64) -> Result<()> {
         while let Err(e) = self.trie.insert(id, value) {
             match e {
-                hashed_array_trie::Error::OutOfMemory(_) => self.trie.storage.borrow_mut().resize(),
+                hashed_array_trie::Error::OutOfMemory(_) => self.trie.storage.resize(),
                 err => Err(err.into()),
             }?;
         }
